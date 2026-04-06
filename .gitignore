@@ -1,0 +1,20 @@
+# Local state
+.pi/
+sessions/
+bin/
+auth.json
+
+# Pi runtime files
+git/
+mcp-cache.json
+mcp-npx-cache.json
+run-history.jsonl
+session-manager-config.toml
+
+# Extension dependencies
+extensions/*/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+tmp/
