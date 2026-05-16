@@ -1,0 +1,10 @@
+{
+  "name": "pi-youtube-transcript-extension",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
+    "youtube-transcript-plus": "^1.0.4"
+  }
+}
