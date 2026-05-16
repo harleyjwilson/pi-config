@@ -2,7 +2,7 @@
  * Files Extension
  *
  * /files command lists files in the current git tree (plus session-referenced files)
- * and offers quick actions like reveal, open, edit, or diff.
+ * and offers quick actions like preview, reveal, open, edit, or diff.
  * /diff is kept as an alias to the same picker.
  */
 
@@ -72,7 +72,13 @@ type GitStatusEntry = {
 };
 
 type FileToolName = "write" | "edit";
-type FileAction = "reveal" | "open" | "edit" | "addToPrompt" | "diff";
+type FileAction =
+  | "preview"
+  | "reveal"
+  | "open"
+  | "edit"
+  | "addToPrompt"
+  | "diff";
 
 type SessionFileChange = {
   operations: Set<FileToolName>;
@@ -704,14 +710,15 @@ const getEditableContent = (target: FileEntry): EditCheckResult => {
 
 const showActionSelector = async (
   ctx: ExtensionContext,
-  options: { canEdit: boolean; canDiff: boolean },
+  options: { canPreview: boolean; canEdit: boolean; canDiff: boolean },
 ): Promise<FileAction | null> => {
   const actions: SelectItem[] = [
-    ...(options.canDiff ? [{ value: "diff", label: "View git diff" }] : []),
-    { value: "reveal", label: "Reveal in Finder" },
-    { value: "open", label: "Open" },
-    { value: "addToPrompt", label: "Add to prompt" },
+    { value: "addToPrompt", label: "Add to Prompt" },
     ...(options.canEdit ? [{ value: "edit", label: "Edit" }] : []),
+    { value: "open", label: "Open" },
+    ...(options.canPreview ? [{ value: "preview", label: "Preview" }] : []),
+    { value: "reveal", label: "Reveal in Finder" },
+    ...(options.canDiff ? [{ value: "diff", label: "View Git Diff" }] : []),
   ];
 
   return ctx.ui.custom<FileAction | null>((tui, theme, _kb, done) => {
@@ -870,14 +877,14 @@ const revealPath = async (
   }
 };
 
-const renderDiffOverlay = async (
+const renderTextOverlay = async (
   ctx: ExtensionContext,
   title: string,
-  diffText: string,
+  subtitle: string,
+  text: string,
+  emptyText: string,
 ): Promise<void> => {
-  const rawLines = diffText.trimEnd()
-    ? diffText.trimEnd().split("\n")
-    : ["No git diff for this file."];
+  const rawLines = text.trimEnd() ? text.trimEnd().split("\n") : [emptyText];
 
   await ctx.ui.custom<void>(
     (tui, theme, keybindings, done) => {
@@ -902,11 +909,23 @@ const renderDiffOverlay = async (
           const borderColor = (text: string) => theme.fg("borderMuted", text);
           const top = borderColor(`┌${"─".repeat(innerWidth)}┐`);
           const bottom = borderColor(`└${"─".repeat(innerWidth)}┘`);
-          const lines: Array<{ text: string; style?: (text: string) => string }> = [];
-          lines.push({ text: ` ${title} `, style: (text) => theme.fg("accent", text) });
-          lines.push({ text: "git diff via delta -- " + title, style: (text) => theme.fg("dim", text) });
+          const lines: Array<{
+            text: string;
+            style?: (text: string) => string;
+          }> = [];
+          lines.push({
+            text: ` ${title} `,
+            style: (text) => theme.fg("accent", text),
+          });
+          lines.push({
+            text: subtitle,
+            style: (text) => theme.fg("dim", text),
+          });
 
-          for (const line of rawLines.slice(scrollOffset, scrollOffset + viewHeight)) {
+          for (const line of rawLines.slice(
+            scrollOffset,
+            scrollOffset + viewHeight,
+          )) {
             lines.push({ text: line.replace(/\t/g, "  ") });
           }
           while (lines.length < headerLines + viewHeight) {
@@ -924,7 +943,9 @@ const renderDiffOverlay = async (
             const plain = truncateToWidth(line.text, innerWidth, "…");
             const padding = Math.max(0, innerWidth - visibleWidth(plain));
             const styled = line.style ? line.style(plain) : plain;
-            return borderColor("│") + styled + " ".repeat(padding) + borderColor("│");
+            return (
+              borderColor("│") + styled + " ".repeat(padding) + borderColor("│")
+            );
           });
           return [top, ...framed, bottom];
         },
@@ -936,7 +957,10 @@ const renderDiffOverlay = async (
           }
           if (keybindings.matches(data, "tui.select.up") || data === "k") {
             scrollOffset -= 1;
-          } else if (keybindings.matches(data, "tui.select.down") || data === "j") {
+          } else if (
+            keybindings.matches(data, "tui.select.down") ||
+            data === "j"
+          ) {
             scrollOffset += 1;
           } else if (
             keybindings.matches(data, "tui.select.pageUp") ||
@@ -962,6 +986,20 @@ const renderDiffOverlay = async (
       overlay: true,
       overlayOptions: { width: "98%", maxHeight: "95%", anchor: "center" },
     },
+  );
+};
+
+const renderDiffOverlay = async (
+  ctx: ExtensionContext,
+  title: string,
+  diffText: string,
+): Promise<void> => {
+  await renderTextOverlay(
+    ctx,
+    title,
+    "git diff via delta -- " + title,
+    diffText,
+    "No git diff for this file.",
   );
 };
 
@@ -1021,6 +1059,59 @@ const openDiff = async (
     .filter(Boolean)
     .join("\n\n");
   await renderDiffOverlay(ctx, target.displayPath, diffText);
+};
+
+const openPreview = async (
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  target: FileEntry,
+  editCheck: EditCheckResult,
+): Promise<void> => {
+  if (!existsSync(target.resolvedPath)) {
+    ctx.ui.notify(`File not found: ${target.displayPath}`, "error");
+    return;
+  }
+
+  if (!editCheck.allowed) {
+    ctx.ui.notify(editCheck.reason ?? "File cannot be previewed", "warning");
+    return;
+  }
+
+  const previewWidth = Math.max(
+    80,
+    Math.floor(((process.stdout.columns || 120) * 98) / 100) - 4,
+  );
+  const bat = await pi.exec(
+    "bat",
+    [
+      "--color=always",
+      "--paging=never",
+      "--style=plain",
+      "--terminal-width",
+      String(previewWidth),
+      target.resolvedPath,
+    ],
+    { cwd: ctx.cwd },
+  );
+
+  const previewText = bat.code === 0 ? bat.stdout : (editCheck.content ?? "");
+  if (bat.code !== 0) {
+    const errorMessage = bat.stderr?.trim();
+    if (errorMessage) {
+      ctx.ui.notify(
+        `bat failed, using plain preview: ${errorMessage}`,
+        "warning",
+      );
+    }
+  }
+
+  await renderTextOverlay(
+    ctx,
+    target.displayPath,
+    "preview via bat/less -- " + target.displayPath,
+    previewText,
+    "File is empty.",
+  );
 };
 
 const addFileToPrompt = (ctx: ExtensionContext, target: FileEntry): void => {
@@ -1219,6 +1310,7 @@ const runFileBrowser = async (
     const editCheck = getEditableContent(selected);
     const canDiff =
       selected.isTracked && !selected.isDirectory && Boolean(gitRoot);
+    const canPreview = editCheck.allowed;
 
     if (quickAction === "diff") {
       await openDiff(pi, ctx, selected, gitRoot);
@@ -1226,6 +1318,7 @@ const runFileBrowser = async (
     }
 
     const action = await showActionSelector(ctx, {
+      canPreview,
       canEdit: editCheck.allowed,
       canDiff,
     });
@@ -1234,6 +1327,9 @@ const runFileBrowser = async (
     }
 
     switch (action) {
+      case "preview":
+        await openPreview(pi, ctx, selected, editCheck);
+        break;
       case "open":
         await openPath(pi, ctx, selected);
         break;
@@ -1304,5 +1400,4 @@ export default function (pi: ExtensionAPI): void {
       });
     },
   });
-
 }
