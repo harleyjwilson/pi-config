@@ -3,5 +3,5 @@
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.5",
   "defaultThinkingLevel": "medium",
-  "theme": "Tokyo Night Storm"
+  "theme": "dark"
 }
