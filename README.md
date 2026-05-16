@@ -55,8 +55,7 @@ Loaded on demand when relevant.
 | Command               | Description                                                                    |
 | --------------------- | ------------------------------------------------------------------------------ |
 | `/answer`             | Extract questions from the last assistant message into an interactive Q&A flow |
-| `/brave-search-setup` | Store a Brave Search API key in `~/.pi/agent/auth.json`                        |
-| `/brave-search-check` | Check whether the Brave Search API key is configured                           |
+| `/brave-search`       | Set/get the Brave Search API key or print the Brave usage dashboard link       |
 | `/files`              | Browse repo files and files referenced in the current session                  |
 | `/review`             | Review code changes, commits, branches, GitHub/Codeberg PRs, or folders       |
 | `/end-review`         | Exit the current review session                                                |

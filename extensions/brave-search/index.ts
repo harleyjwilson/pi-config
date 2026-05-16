@@ -64,9 +64,15 @@ function storeBraveApiKey(key: string) {
   writeAuthFile(auth);
 }
 
+function maskBraveApiKey(key: string) {
+  const dashIndex = key.indexOf("-");
+  if (dashIndex === -1) return "*".repeat(key.length);
+  return `${key.slice(0, dashIndex + 1)}${"*".repeat(Math.max(key.length - dashIndex - 1, 0))}`;
+}
+
 function apiKey() {
   const key = getStoredBraveApiKey();
-  if (!key) throw new Error(`Missing Brave Search API key in ${authPath()}. Run /brave-search-setup to add it.`);
+  if (!key) throw new Error(`Missing Brave Search API key in ${authPath()}. Run /brave-search and choose Set API Key to add it.`);
   return key;
 }
 
@@ -306,38 +312,70 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("brave-search-setup", {
-    description: "Prompt for a Brave Search API key and save it to ~/.pi/agent/auth.json",
+  pi.registerCommand("brave-search", {
+    description: "Manage Brave Search API key setup, view the masked key, or open usage info",
     handler: async (args, ctx) => {
       const supplied = (args ?? "").trim();
-      const key = supplied || (await ctx.ui.input(
-        "Brave Search API key",
-        "Paste your Brave Search API key from https://api-dashboard.search.brave.com/app/keys",
-      ));
+      const lower = supplied.toLowerCase();
 
-      if (!key?.trim()) {
-        ctx.ui.notify("Brave Search setup cancelled.", "info");
+      const setApiKey = async (keyArg?: string) => {
+        const key = keyArg || (await ctx.ui.input(
+          "Brave Search API key",
+          "Paste your Brave Search API key from https://api-dashboard.search.brave.com/app/keys",
+        ));
+
+        if (!key?.trim()) {
+          ctx.ui.notify("Brave Search setup cancelled.", "info");
+          return;
+        }
+
+        try {
+          storeBraveApiKey(key);
+          ctx.ui.notify(`Saved Brave Search API key to ${authPath()}.`, "success");
+        } catch (error) {
+          ctx.ui.notify(`Could not save Brave Search API key: ${asErrorMessage(error)}`, "error");
+        }
+      };
+
+      const getApiKey = () => {
+        try {
+          const key = apiKey();
+          ctx.ui.notify(`Brave Search API key: ${maskBraveApiKey(key)}\nLocation: ${authPath()}`, "info");
+        } catch (error) {
+          ctx.ui.notify(asErrorMessage(error), "error");
+        }
+      };
+
+      const viewUsage = () => {
+        ctx.ui.notify("Go to:\nhttps://api-dashboard.search.brave.com/app/dashboard", "info");
+      };
+
+      if (lower === "set" || lower === "set api key") {
+        await setApiKey();
+        return;
+      }
+      if (lower.startsWith("set ")) {
+        await setApiKey(supplied.slice(4).trim());
+        return;
+      }
+      if (lower === "get" || lower === "get api key" || lower === "check") {
+        getApiKey();
+        return;
+      }
+      if (lower === "usage" || lower === "view usage") {
+        viewUsage();
+        return;
+      }
+      if (supplied) {
+        await setApiKey(supplied);
         return;
       }
 
-      try {
-        storeBraveApiKey(key);
-        ctx.ui.notify(`Saved Brave Search API key to ${authPath()}.`, "success");
-      } catch (error) {
-        ctx.ui.notify(`Could not save Brave Search API key: ${asErrorMessage(error)}`, "error");
-      }
-    },
-  });
-
-  pi.registerCommand("brave-search-check", {
-    description: "Check whether a Brave Search API key is configured in ~/.pi/agent/auth.json",
-    handler: async (_args, ctx) => {
-      try {
-        apiKey();
-        ctx.ui.notify(`Brave Search API key is configured in ${authPath()}.`, "success");
-      } catch (error) {
-        ctx.ui.notify(asErrorMessage(error), "error");
-      }
+      const choice = await ctx.ui.select("Brave Search", ["Set API Key", "Get API Key", "View Usage"]);
+      if (choice === "Set API Key") await setApiKey();
+      else if (choice === "Get API Key") getApiKey();
+      else if (choice === "View Usage") viewUsage();
+      else ctx.ui.notify("Brave Search cancelled.", "info");
     },
   });
 }

@@ -26,28 +26,24 @@ Web search and page-content extraction for Pi using the official Brave Search AP
 
 3. Restart Pi or run `/reload`.
 
-4. Store your Brave API key in Pi's `auth.json`:
+4. Manage your Brave API key from Pi:
 
    ```text
-   /brave-search-setup
+   /brave-search
    ```
+
+   Choose **Set API Key**, **Get API Key**, or **View Usage** from the menu.
 
    You can also pass the key directly:
 
    ```text
-   /brave-search-setup YOUR_BRAVE_API_KEY
+   /brave-search YOUR_BRAVE_API_KEY
    ```
 
    The extension stores the key under the `brave-search` entry in:
 
    ```text
    ~/.pi/agent/auth.json
-   ```
-
-5. Optional: verify configuration in Pi:
-
-   ```text
-   /brave-search-check
    ```
 
 ## Tools
@@ -107,9 +103,11 @@ Fetch the markdown for this documentation page: https://docs.example.com/api
 
 ## Commands
 
-### `/brave-search-setup`
+### `/brave-search`
 
-Prompts for a Brave Search API key and saves it to `~/.pi/agent/auth.json`.
+Opens a menu to set the Brave Search API key, print the masked stored API key and `auth.json` location, or print the usage dashboard link.
+
+Selecting **Set API Key** prompts for a Brave Search API key and saves it to `~/.pi/agent/auth.json`.
 
 The stored entry looks like:
 
@@ -123,12 +121,16 @@ The stored entry looks like:
 }
 ```
 
-### `/brave-search-check`
+Selecting **Get API Key** prints the stored API key with everything after the first `-` masked, plus the `auth.json` path.
 
-Checks whether a Brave Search API key is configured in `~/.pi/agent/auth.json`.
+Selecting **View Usage** prints:
+
+```text
+https://api-dashboard.search.brave.com/app/dashboard
+```
 
 ## Notes
 
-- `brave_search` uses the Brave Search API and requires a key stored by `/brave-search-setup`.
+- `brave_search` uses the Brave Search API and requires a key stored by `/brave-search`.
 - `brave_scrape` fetches pages directly and does not require a separate scraping service.
 - Scraping may fail on sites that block automated requests, require login, or render all content client-side.
