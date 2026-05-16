@@ -9,7 +9,6 @@
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
-  mkdtempSync,
   readFileSync,
   realpathSync,
   statSync,
@@ -34,7 +33,9 @@ import {
   SelectList,
   Spacer,
   Text,
+  truncateToWidth,
   type TUI,
+  visibleWidth,
 } from "@mariozechner/pi-tui";
 
 type ContentBlock = {
@@ -71,6 +72,7 @@ type GitStatusEntry = {
 };
 
 type FileToolName = "write" | "edit";
+type FileAction = "reveal" | "open" | "edit" | "addToPrompt" | "diff";
 
 type SessionFileChange = {
   operations: Set<FileToolName>;
@@ -702,24 +704,17 @@ const getEditableContent = (target: FileEntry): EditCheckResult => {
 
 const showActionSelector = async (
   ctx: ExtensionContext,
-  options: { canQuickLook: boolean; canEdit: boolean; canDiff: boolean },
-): Promise<
-  "reveal" | "quicklook" | "open" | "edit" | "addToPrompt" | "diff" | null
-> => {
+  options: { canEdit: boolean; canDiff: boolean },
+): Promise<FileAction | null> => {
   const actions: SelectItem[] = [
-    ...(options.canDiff ? [{ value: "diff", label: "Diff in VS Code" }] : []),
+    ...(options.canDiff ? [{ value: "diff", label: "View git diff" }] : []),
     { value: "reveal", label: "Reveal in Finder" },
     { value: "open", label: "Open" },
     { value: "addToPrompt", label: "Add to prompt" },
-    ...(options.canQuickLook
-      ? [{ value: "quicklook", label: "Open in Quick Look" }]
-      : []),
     ...(options.canEdit ? [{ value: "edit", label: "Edit" }] : []),
   ];
 
-  return ctx.ui.custom<
-    "reveal" | "quicklook" | "open" | "edit" | "addToPrompt" | "diff" | null
-  >((tui, theme, _kb, done) => {
+  return ctx.ui.custom<FileAction | null>((tui, theme, _kb, done) => {
     const container = new Container();
     container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
     container.addChild(
@@ -734,16 +729,7 @@ const showActionSelector = async (
       noMatch: (text) => theme.fg("warning", text),
     });
 
-    selectList.onSelect = (item) =>
-      done(
-        item.value as
-          | "reveal"
-          | "quicklook"
-          | "open"
-          | "edit"
-          | "addToPrompt"
-          | "diff",
-      );
+    selectList.onSelect = (item) => done(item.value as FileAction);
     selectList.onCancel = () => done(null);
 
     container.addChild(selectList);
@@ -884,34 +870,99 @@ const revealPath = async (
   }
 };
 
-const quickLookPath = async (
-  pi: ExtensionAPI,
+const renderDiffOverlay = async (
   ctx: ExtensionContext,
-  target: FileEntry,
+  title: string,
+  diffText: string,
 ): Promise<void> => {
-  if (process.platform !== "darwin") {
-    ctx.ui.notify("Quick Look is only available on macOS", "warning");
-    return;
-  }
+  const rawLines = diffText.trimEnd()
+    ? diffText.trimEnd().split("\n")
+    : ["No git diff for this file."];
 
-  if (!existsSync(target.resolvedPath)) {
-    ctx.ui.notify(`File not found: ${target.displayPath}`, "error");
-    return;
-  }
+  await ctx.ui.custom<void>(
+    (tui, theme, keybindings, done) => {
+      let scrollOffset = 0;
+      let viewHeight = 1;
 
-  const isDirectory =
-    target.isDirectory || statSync(target.resolvedPath).isDirectory();
-  if (isDirectory) {
-    ctx.ui.notify("Quick Look only works on files", "warning");
-    return;
-  }
+      const clampScroll = () => {
+        const maxScroll = Math.max(0, rawLines.length - viewHeight);
+        scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+      };
 
-  const result = await pi.exec("qlmanage", ["-p", target.resolvedPath]);
-  if (result.code !== 0) {
-    const errorMessage =
-      result.stderr?.trim() || `Failed to Quick Look ${target.displayPath}`;
-    ctx.ui.notify(errorMessage, "error");
-  }
+      return {
+        render(width: number) {
+          const rows = tui.terminal.rows || 24;
+          const maxHeight = Math.max(12, rows - 4);
+          const innerWidth = Math.max(10, width - 2);
+          const headerLines = 2;
+          const footerLines = 1;
+          viewHeight = Math.max(1, maxHeight - headerLines - footerLines - 2);
+          clampScroll();
+
+          const borderColor = (text: string) => theme.fg("borderMuted", text);
+          const top = borderColor(`┌${"─".repeat(innerWidth)}┐`);
+          const bottom = borderColor(`└${"─".repeat(innerWidth)}┘`);
+          const lines: Array<{ text: string; style?: (text: string) => string }> = [];
+          lines.push({ text: ` ${title} `, style: (text) => theme.fg("accent", text) });
+          lines.push({ text: "git diff via delta -- " + title, style: (text) => theme.fg("dim", text) });
+
+          for (const line of rawLines.slice(scrollOffset, scrollOffset + viewHeight)) {
+            lines.push({ text: line.replace(/\t/g, "  ") });
+          }
+          while (lines.length < headerLines + viewHeight) {
+            lines.push({ text: "" });
+          }
+
+          const start = Math.min(rawLines.length, scrollOffset + 1);
+          const end = Math.min(rawLines.length, scrollOffset + viewHeight);
+          lines.push({
+            text: `j/k scroll • ctrl+d/u half-page • g/G top/bottom • esc/q close • ${start}-${end}/${rawLines.length}`,
+            style: (text) => theme.fg("dim", text),
+          });
+
+          const framed = lines.map((line) => {
+            const plain = truncateToWidth(line.text, innerWidth, "…");
+            const padding = Math.max(0, innerWidth - visibleWidth(plain));
+            const styled = line.style ? line.style(plain) : plain;
+            return borderColor("│") + styled + " ".repeat(padding) + borderColor("│");
+          });
+          return [top, ...framed, bottom];
+        },
+        invalidate() {},
+        handleInput(data: string) {
+          if (keybindings.matches(data, "tui.select.cancel") || data === "q") {
+            done();
+            return;
+          }
+          if (keybindings.matches(data, "tui.select.up") || data === "k") {
+            scrollOffset -= 1;
+          } else if (keybindings.matches(data, "tui.select.down") || data === "j") {
+            scrollOffset += 1;
+          } else if (
+            keybindings.matches(data, "tui.select.pageUp") ||
+            matchesKey(data, "ctrl+u")
+          ) {
+            scrollOffset -= Math.max(1, Math.floor(viewHeight / 2));
+          } else if (
+            keybindings.matches(data, "tui.select.pageDown") ||
+            matchesKey(data, "ctrl+d")
+          ) {
+            scrollOffset += Math.max(1, Math.floor(viewHeight / 2));
+          } else if (data === "g") {
+            scrollOffset = 0;
+          } else if (data === "G") {
+            scrollOffset = rawLines.length;
+          }
+          clampScroll();
+          tui.requestRender();
+        },
+      };
+    },
+    {
+      overlay: true,
+      overlayOptions: { width: "98%", maxHeight: "95%", anchor: "center" },
+    },
+  );
 };
 
 const openDiff = async (
@@ -929,47 +980,47 @@ const openDiff = async (
     .relative(gitRoot, target.resolvedPath)
     .split(path.sep)
     .join("/");
-  const tmpDir = mkdtempSync(path.join(os.tmpdir(), "pi-files-"));
-  const tmpFile = path.join(tmpDir, path.basename(target.displayPath));
 
-  const existsInHead = await pi.exec(
-    "git",
-    ["cat-file", "-e", `HEAD:${relativePath}`],
-    { cwd: gitRoot },
+  const deltaWidth = Math.max(
+    80,
+    Math.floor(((process.stdout.columns || 120) * 98) / 100) - 4,
   );
-  if (existsInHead.code === 0) {
-    const result = await pi.exec("git", ["show", `HEAD:${relativePath}`], {
-      cwd: gitRoot,
-    });
-    if (result.code !== 0) {
-      const errorMessage =
-        result.stderr?.trim() || `Failed to diff ${target.displayPath}`;
-      ctx.ui.notify(errorMessage, "error");
-      return;
-    }
-    writeFileSync(tmpFile, result.stdout ?? "", "utf8");
-  } else {
-    writeFileSync(tmpFile, "", "utf8");
-  }
-
-  let workingPath = target.resolvedPath;
-  if (!existsSync(target.resolvedPath)) {
-    workingPath = path.join(
-      tmpDir,
-      `pi-files-working-${path.basename(target.displayPath)}`,
+  const runDeltaDiff = (args: string[]) =>
+    pi.exec(
+      "bash",
+      [
+        "-o",
+        "pipefail",
+        "-c",
+        'file="$1"; width="$2"; shift 2; git diff --color=always "$@" -- "$file" | COLUMNS="$width" delta --width "$width"',
+        "bash",
+        relativePath,
+        String(deltaWidth),
+        ...args,
+      ],
+      { cwd: gitRoot },
     );
-    writeFileSync(workingPath, "", "utf8");
+
+  const unstaged = await runDeltaDiff([]);
+  if (unstaged.code !== 0) {
+    const errorMessage =
+      unstaged.stderr?.trim() || `Failed to diff ${target.displayPath}`;
+    ctx.ui.notify(errorMessage, "error");
+    return;
   }
 
-  const openResult = await pi.exec("code", ["--diff", tmpFile, workingPath], {
-    cwd: gitRoot,
-  });
-  if (openResult.code !== 0) {
+  const staged = await runDeltaDiff(["--cached"]);
+  if (staged.code !== 0) {
     const errorMessage =
-      openResult.stderr?.trim() ||
-      `Failed to open diff for ${target.displayPath}`;
+      staged.stderr?.trim() || `Failed to diff ${target.displayPath}`;
     ctx.ui.notify(errorMessage, "error");
+    return;
   }
+
+  const diffText = [staged.stdout?.trimEnd(), unstaged.stdout?.trimEnd()]
+    .filter(Boolean)
+    .join("\n\n");
+  await renderDiffOverlay(ctx, target.displayPath, diffText);
 };
 
 const addFileToPrompt = (ctx: ExtensionContext, target: FileEntry): void => {
@@ -1165,7 +1216,6 @@ const runFileBrowser = async (
 
     lastSelectedPath = selected.canonicalPath;
 
-    const canQuickLook = process.platform === "darwin" && !selected.isDirectory;
     const editCheck = getEditableContent(selected);
     const canDiff =
       selected.isTracked && !selected.isDirectory && Boolean(gitRoot);
@@ -1176,7 +1226,6 @@ const runFileBrowser = async (
     }
 
     const action = await showActionSelector(ctx, {
-      canQuickLook,
       canEdit: editCheck.allowed,
       canDiff,
     });
@@ -1185,9 +1234,6 @@ const runFileBrowser = async (
     }
 
     switch (action) {
-      case "quicklook":
-        await quickLookPath(pi, ctx, selected);
-        break;
       case "open":
         await openPath(pi, ctx, selected);
         break;
@@ -1259,36 +1305,4 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerShortcut("ctrl+shift+r", {
-    description: "Quick Look the latest file reference",
-    handler: async (ctx) => {
-      const entries = ctx.sessionManager.getBranch();
-      const latest = findLatestFileReference(entries, ctx.cwd);
-
-      if (!latest) {
-        ctx.ui.notify("No file reference found in the session", "warning");
-        return;
-      }
-
-      const canonical = toCanonicalPath(latest.path);
-      if (!canonical) {
-        ctx.ui.notify(`File not found: ${latest.display}`, "error");
-        return;
-      }
-
-      await quickLookPath(pi, ctx, {
-        canonicalPath: canonical.canonicalPath,
-        resolvedPath: canonical.canonicalPath,
-        displayPath: latest.display,
-        exists: true,
-        isDirectory: canonical.isDirectory,
-        status: undefined,
-        inRepo: false,
-        isTracked: false,
-        isReferenced: true,
-        hasSessionChange: false,
-        lastTimestamp: 0,
-      });
-    },
-  });
 }
