@@ -47,6 +47,7 @@ Loaded on demand when relevant.
 | **review/**             | Adds review commands and review-loop tooling                                 |
 | **todos/**              | Adds `/todos` and todo management UI/tooling for `.pi/todos`                 |
 | **update/**             | Adds `/update` and `--update` to update Pi via the detected install method    |
+| **usage/**              | Adds `/usage` to print the Codex cloud usage analytics link                  |
 | **uv/**                 | Wraps bash/Python tooling so agents use `uv` workflows instead of pip/venv   |
 | **youtube-transcript/** | Adds `/youtube-transcript` for YouTube transcript fetching                   |
 
@@ -61,6 +62,7 @@ Loaded on demand when relevant.
 | `/end-review`         | Exit the current review session                                                |
 | `/todos`              | Browse and manage todos from `.pi/todos`                                       |
 | `/update`             | Update Pi using vp, pnpm, bun, npm, brew, or native detection                  |
+| `/usage`              | Print the Codex cloud usage analytics link                                     |
 | `/youtube-transcript` | Fetch a YouTube transcript by video id/URL and optional language               |
 
 ## References and credits
