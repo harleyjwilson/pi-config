@@ -1,9 +1,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { fetchTranscript, listLanguages } from "youtube-transcript-plus";
+import { fetchTranscript } from "youtube-transcript-plus";
 
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const DEFAULT_LANG = "en";
 
 type TranscriptSegment = {
   text: string;
@@ -13,6 +14,13 @@ type TranscriptSegment = {
 };
 
 type TranscriptResult = TranscriptSegment[] | { segments: TranscriptSegment[]; videoDetails?: Record<string, unknown> };
+
+type CaptionTrack = {
+  baseUrl?: string;
+  languageCode?: string;
+  name?: { simpleText?: string; runs?: Array<{ text?: string }> };
+  kind?: string;
+};
 
 function asErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
@@ -26,6 +34,14 @@ function formatTimestamp(seconds: number) {
 
   if (h > 0) return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function decodeHtmlEntities(text: string) {
+  return text.replace(/&(#(\d+)|#x([\da-fA-F]+)|amp|lt|gt|quot|apos|#39);/g, (entity, _numeric, decimal, hex) => {
+    if (decimal) return String.fromCodePoint(Number.parseInt(decimal, 10));
+    if (hex) return String.fromCodePoint(Number.parseInt(hex, 16));
+    return ({ "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&apos;": "'", "&#39;": "'" } as Record<string, string>)[entity] ?? entity;
+  });
 }
 
 function extractVideoId(input: string) {
@@ -52,6 +68,79 @@ function extractVideoId(input: string) {
   return match?.[1] ?? trimmed;
 }
 
+function captionTrackName(track: CaptionTrack) {
+  return track.name?.simpleText ?? track.name?.runs?.map((run) => run.text ?? "").join("") ?? track.languageCode ?? "Unknown";
+}
+
+function normalizeLanguage(lang?: string) {
+  const normalized = lang?.trim();
+  if (!normalized) return DEFAULT_LANG;
+  return /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(normalized) ? normalized : DEFAULT_LANG;
+}
+
+async function getCaptionTracks(videoId: string, options: { userAgent: string; signal?: AbortSignal }) {
+  const watchResponse = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: { "User-Agent": options.userAgent },
+    signal: options.signal,
+  });
+  if (!watchResponse.ok) return [];
+
+  const watchHtml = await watchResponse.text();
+  const apiKey = watchHtml.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/)?.[1];
+  if (!apiKey) return [];
+
+  const playerResponse = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": options.userAgent },
+    body: JSON.stringify({
+      context: { client: { clientName: "ANDROID", clientVersion: "20.10.38" } },
+      videoId,
+    }),
+    signal: options.signal,
+  });
+  if (!playerResponse.ok) return [];
+
+  const playerJson = await playerResponse.json();
+  const tracklist = playerJson?.captions?.playerCaptionsTracklistRenderer ?? playerJson?.playerCaptionsTracklistRenderer;
+  return Array.isArray(tracklist?.captionTracks) ? (tracklist.captionTracks as CaptionTrack[]) : [];
+}
+
+async function fetchTranscriptWithFallback(
+  videoId: string,
+  options: { lang?: string; includeMetadata: boolean; signal?: AbortSignal },
+) {
+  const commonOptions = {
+    userAgent: USER_AGENT,
+    retries: 2,
+    retryDelay: 1000,
+    signal: options.signal,
+  };
+
+  try {
+    const result = (await fetchTranscript(videoId, {
+      ...commonOptions,
+      lang: options.lang || undefined,
+      videoDetails: options.includeMetadata,
+    } as any)) as TranscriptResult;
+    return { result, warning: undefined as string | undefined };
+  } catch (error) {
+    if (!options.lang) throw error;
+
+    const tracks = await getCaptionTracks(videoId, { userAgent: USER_AGENT, signal: options.signal });
+    const availableLanguages = tracks.map((track) => track.languageCode).filter(Boolean) as string[];
+    if (!availableLanguages.length || availableLanguages.includes(options.lang)) throw error;
+
+    const result = (await fetchTranscript(videoId, {
+      ...commonOptions,
+      videoDetails: options.includeMetadata,
+    } as any)) as TranscriptResult;
+    return {
+      result,
+      warning: `Requested transcript language "${options.lang}" is not available; used "${availableLanguages[0]}" instead.`,
+    };
+  }
+}
+
 async function getTranscript(params: {
   video: string;
   lang?: string;
@@ -61,19 +150,13 @@ async function getTranscript(params: {
   signal?: AbortSignal;
 }) {
   const videoId = extractVideoId(params.video);
-  const commonOptions = {
-    lang: params.lang || undefined,
-    userAgent: USER_AGENT,
-    retries: 2,
-    retryDelay: 1000,
-    signal: params.signal,
-  };
+  const lang = normalizeLanguage(params.lang);
 
   if (params.listOnly) {
-    const languages = await listLanguages(videoId, commonOptions);
+    const languages = await getCaptionTracks(videoId, { userAgent: USER_AGENT, signal: params.signal });
     const text = languages.length
       ? languages
-          .map((language: any) => `- ${language.languageCode}: ${language.languageName}${language.isAutoGenerated ? " (auto-generated)" : ""}`)
+          .map((language) => `- ${language.languageCode}: ${captionTrackName(language)}${language.kind === "asr" ? " (auto-generated)" : ""}`)
           .join("\n")
       : "No transcript languages were reported for this video.";
     return {
@@ -83,16 +166,17 @@ async function getTranscript(params: {
     };
   }
 
-  const result = (await fetchTranscript(videoId, {
-    ...commonOptions,
-    videoDetails: params.includeMetadata ?? true,
-  })) as TranscriptResult;
+  const { result, warning } = await fetchTranscriptWithFallback(videoId, {
+    lang,
+    includeMetadata: params.includeMetadata ?? true,
+    signal: params.signal,
+  });
   const segments = Array.isArray(result) ? result : result.segments;
   const videoDetails = Array.isArray(result) ? undefined : result.videoDetails;
 
   const text = segments
     .map((entry) => {
-      const line = entry.text.replace(/\s+/g, " ").trim();
+      const line = decodeHtmlEntities(entry.text).replace(/\s+/g, " ").trim();
       if (!params.timestamps) return line;
       return `[${formatTimestamp(entry.offset)}] ${line}`;
     })
@@ -101,10 +185,11 @@ async function getTranscript(params: {
 
   return {
     videoId,
-    text,
+    text: warning ? `${warning}\n\n${text}` : text,
     details: {
       videoId,
-      lang: params.lang,
+      lang,
+      warning,
       videoDetails,
       segmentCount: segments.length,
       transcript: segments,
@@ -128,7 +213,7 @@ export default function (pi: ExtensionAPI) {
       listLanguages: Type.Optional(Type.Boolean({ description: "Only list available transcript languages instead of fetching a transcript." })),
       includeMetadata: Type.Optional(Type.Boolean({ description: "Include YouTube video metadata in tool details. Defaults to true." })),
     }),
-    async execute(_toolCallId, params, signal, onUpdate) {
+    async execute(_toolCallId: unknown, params: any, signal?: AbortSignal, onUpdate?: (message: any) => void) {
       onUpdate?.({ content: [{ type: "text", text: "Fetching YouTube transcript..." }] });
       try {
         const result = await getTranscript({
@@ -155,7 +240,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("youtube-transcript", {
     description: "Fetch a YouTube transcript. Usage: /youtube-transcript <video-id-or-url> [lang]",
-    handler: async (args, ctx) => {
+    handler: async (args: string, ctx: any) => {
       const [video, lang] = args.trim().split(/\s+/);
       if (!video) {
         ctx.ui.notify("Usage: /youtube-transcript <video-id-or-url> [lang]", "error");

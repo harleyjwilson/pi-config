@@ -2,8 +2,12 @@
 
 import { fetchTranscript } from 'youtube-transcript-plus';
 
+const USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const DEFAULT_LANG = 'en';
+
 const video = process.argv[2];
-const lang = process.argv[3];
+const lang = normalizeLanguage(process.argv[3]);
 
 if (!video) {
   console.error('Usage: transcript.js <video-id-or-url> [lang]');
@@ -14,21 +18,68 @@ if (!video) {
 }
 
 try {
-  const transcript = await fetchTranscript(extractVideoId(video), {
-    lang,
-    retries: 2,
-    retryDelay: 1000,
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  });
+  const videoId = extractVideoId(video);
+  const { transcript, warning } = await fetchTranscriptWithFallback(videoId, lang);
+
+  if (warning) console.error(warning);
 
   for (const entry of transcript) {
     const timestamp = formatTimestamp(entry.offset);
-    console.log(`[${timestamp}] ${entry.text.replace(/\s+/g, ' ').trim()}`);
+    console.log(`[${timestamp}] ${decodeHtmlEntities(entry.text).replace(/\s+/g, ' ').trim()}`);
   }
 } catch (error) {
   console.error('Error fetching transcript:', error instanceof Error ? error.message : String(error));
   process.exit(1);
+}
+
+async function fetchTranscriptWithFallback(videoId, requestedLang) {
+  const options = { retries: 2, retryDelay: 1000, userAgent: USER_AGENT };
+
+  try {
+    return { transcript: await fetchTranscript(videoId, { ...options, lang: requestedLang }), warning: undefined };
+  } catch (error) {
+    if (!requestedLang) throw error;
+
+    const tracks = await getCaptionTracks(videoId);
+    const availableLanguages = tracks.map((track) => track.languageCode).filter(Boolean);
+    if (!availableLanguages.length || availableLanguages.includes(requestedLang)) throw error;
+
+    return {
+      transcript: await fetchTranscript(videoId, options),
+      warning: `Requested transcript language "${requestedLang}" is not available; used "${availableLanguages[0]}" instead.`,
+    };
+  }
+}
+
+async function getCaptionTracks(videoId) {
+  const watchResponse = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+    headers: { 'User-Agent': USER_AGENT },
+  });
+  if (!watchResponse.ok) return [];
+
+  const watchHtml = await watchResponse.text();
+  const apiKey = watchHtml.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/)?.[1];
+  if (!apiKey) return [];
+
+  const playerResponse = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+    body: JSON.stringify({
+      context: { client: { clientName: 'ANDROID', clientVersion: '20.10.38' } },
+      videoId,
+    }),
+  });
+  if (!playerResponse.ok) return [];
+
+  const playerJson = await playerResponse.json();
+  const tracklist = playerJson?.captions?.playerCaptionsTracklistRenderer ?? playerJson?.playerCaptionsTracklistRenderer;
+  return Array.isArray(tracklist?.captionTracks) ? tracklist.captionTracks : [];
+}
+
+function normalizeLanguage(lang) {
+  const normalized = lang?.trim();
+  if (!normalized) return DEFAULT_LANG;
+  return /^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(normalized) ? normalized : DEFAULT_LANG;
 }
 
 function extractVideoId(input) {
@@ -53,6 +104,14 @@ function extractVideoId(input) {
 
   const match = trimmed.match(/(?:v=|youtu\.be\/|shorts\/|embed\/|live\/)([a-zA-Z0-9_-]{11})/);
   return match?.[1] ?? trimmed;
+}
+
+function decodeHtmlEntities(text) {
+  return text.replace(/&(#(\d+)|#x([\da-fA-F]+)|amp|lt|gt|quot|apos|#39);/g, (entity, _numeric, decimal, hex) => {
+    if (decimal) return String.fromCodePoint(Number.parseInt(decimal, 10));
+    if (hex) return String.fromCodePoint(Number.parseInt(hex, 16));
+    return { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'", '&#39;': "'" }[entity] ?? entity;
+  });
 }
 
 function formatTimestamp(seconds) {
