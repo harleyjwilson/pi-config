@@ -1,60 +1,19 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { access, readFile, realpath } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
 
-const PACKAGE_NAME = "@earendil-works/pi-coding-agent";
-const LEGACY_PACKAGE_NAME = "@mariozechner/pi-coding-agent";
-const TRANSIENT_PATTERNS = [
-  /eai_again/i,
-  /etimedout/i,
-  /econnreset/i,
-  /econnrefused/i,
-  /socket hang up/i,
-  /network/i,
-  /timeout/i,
-  /temporar/i,
-  /too many requests/i,
-  /\b429\b/,
-  /\b502\b/,
-  /\b503\b/,
-  /\b504\b/,
+const APPROVE_BUILDS_PATTERNS = [
+  /approve-builds/i,
+  /ignored build scripts/i,
+  /pnpm approve/i,
 ];
 
-type InstallMethod = "vp" | "pnpm" | "bun" | "npm" | "brew" | "native";
-
-type CommandSpec = {
-  command: string;
-  args: string[];
-  label: string;
-};
-
-async function pathExists(path: string) {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
+function compactOutput(output: string) {
+  const trimmed = output.trim();
+  if (!trimmed) return "No output.";
+  return trimmed.length > 1200 ? `${trimmed.slice(-1200)}` : trimmed;
 }
 
-async function resolveCommand(command: string, pi: ExtensionAPI) {
-  const result = await pi.exec("/bin/sh", ["-lc", `command -v ${command} || true`], { timeout: 10_000 });
-  return result.stdout.trim().split("\n")[0] || undefined;
-}
-
-async function resolveAllCommands(command: string, pi: ExtensionAPI) {
-  const result = await pi.exec("/bin/sh", ["-lc", `which -a ${command} 2>/dev/null || command -v ${command} || true`], { timeout: 10_000 });
-  return result.stdout.trim().split("\n").filter(Boolean);
-}
-
-async function fileIncludes(path: string | undefined, needles: string[]) {
-  if (!path) return false;
-  const content = await readFile(path, "utf8").catch(() => "");
-  return needles.some((needle) => content.includes(needle));
-}
-
-function isPnpmPath(path: string | undefined) {
-  return !!path && (path.includes("/.pnpm/") || path.includes("/pnpm/"));
+function needsPnpmBuildApproval(output: string) {
+  return APPROVE_BUILDS_PATTERNS.some((pattern) => pattern.test(output));
 }
 
 async function currentVersion(pi: ExtensionAPI) {
@@ -62,102 +21,76 @@ async function currentVersion(pi: ExtensionAPI) {
   return result.stdout.trim() || result.stderr.trim() || "unknown";
 }
 
-async function detectInstallMethod(pi: ExtensionAPI): Promise<InstallMethod> {
-  const piPath = await resolveCommand("pi", pi);
-  const allPiPaths = await resolveAllCommands("pi", pi);
-  const realPiPath = piPath ? await realpath(piPath).catch(() => piPath) : undefined;
+function parseArgs(args: string) {
+  return args.trim().split(/\s+/).filter(Boolean);
+}
 
-  if (piPath?.includes("/.vite-plus/") || realPiPath?.includes("/.vite-plus/")) return "vp";
-  if (isPnpmPath(piPath) || isPnpmPath(realPiPath) || allPiPaths.some(isPnpmPath) || (await fileIncludes(piPath, ["/pnpm/", "/.pnpm/", "Library/pnpm"]))) return "pnpm";
-  if (piPath?.includes("/.bun/") || realPiPath?.includes("/.bun/")) return "bun";
-  if (piPath?.includes("/Homebrew/") || piPath?.includes("/homebrew/") || realPiPath?.includes("/Homebrew/") || realPiPath?.includes("/homebrew/")) return "brew";
+async function askForPnpmBuildApprovals(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
+  const answer = await ctx.ui.input(
+    "pnpm approve-builds",
+    "Packages to approve, space-separated; use !pkg to reject; type all to approve all; blank skips",
+  );
+  const tokens = parseArgs(answer ?? "");
+  if (tokens.length === 0) return false;
 
-  if (piPath) {
-    let dir = dirname(piPath);
-    for (let i = 0; i < 5; i++) {
-      if (await pathExists(resolve(dir, "node_modules", PACKAGE_NAME)) || await pathExists(resolve(dir, "node_modules", LEGACY_PACKAGE_NAME))) return "npm";
-      dir = dirname(dir);
-    }
+  const approveArgs = tokens.length === 1 && tokens[0]?.toLowerCase() === "all" ? ["approve-builds", "--all"] : ["approve-builds", ...tokens];
+  const result = await pi.exec("pnpm", approveArgs, { timeout: 120_000 });
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+
+  if (result.code !== 0) {
+    ctx.ui.notify(`pnpm approve-builds failed. ${compactOutput(output)}`, "error");
+    return false;
   }
 
-  if (await resolveCommand("vp", pi)) return "vp";
-  if (await resolveCommand("pnpm", pi)) return "pnpm";
-  if (await resolveCommand("bun", pi)) return "bun";
-  if (await resolveCommand("npm", pi)) return "npm";
-  if (await resolveCommand("brew", pi)) return "brew";
-  return "native";
+  ctx.ui.notify(`pnpm approve-builds completed. ${compactOutput(output)}`, "info");
+  return true;
 }
 
-function commandFor(method: InstallMethod): CommandSpec | undefined {
-  switch (method) {
-    case "vp":
-      return { command: "vp", args: ["add", "-g", `${PACKAGE_NAME}@latest`], label: `vp add -g ${PACKAGE_NAME}@latest` };
-    case "bun":
-      return { command: "bun", args: ["add", "-g", `${PACKAGE_NAME}@latest`], label: `bun add -g ${PACKAGE_NAME}@latest` };
-    case "pnpm":
-      return { command: "pnpm", args: ["add", "-g", `${PACKAGE_NAME}@latest`], label: `pnpm add -g ${PACKAGE_NAME}@latest` };
-    case "npm":
-      return { command: "npm", args: ["install", "-g", `${PACKAGE_NAME}@latest`], label: `npm install -g ${PACKAGE_NAME}@latest` };
-    case "brew":
-      return { command: "/bin/sh", args: ["-lc", "brew upgrade pi-coding-agent || brew upgrade pi"], label: "brew upgrade pi-coding-agent || brew upgrade pi" };
-    case "native":
-      return undefined;
-  }
-}
-
-function isTransient(output: string) {
-  return TRANSIENT_PATTERNS.some((pattern) => pattern.test(output));
-}
-
-async function runWithRetry(pi: ExtensionAPI, spec: CommandSpec) {
-  let lastOutput = "";
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const result = await pi.exec(spec.command, spec.args, { timeout: 180_000 });
-    lastOutput = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-    if (result.code === 0) return { ok: true, output: lastOutput, attempts: attempt };
-    if (attempt === 3 || !isTransient(lastOutput)) return { ok: false, output: lastOutput, attempts: attempt };
-    await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
-  }
-  return { ok: false, output: lastOutput, attempts: 3 };
-}
-
-async function updatePi(pi: ExtensionAPI, ctx: ExtensionCommandContext) {
+async function updatePi(pi: ExtensionAPI, ctx: ExtensionCommandContext, args = "") {
   await ctx.waitForIdle();
 
   const before = await currentVersion(pi).catch(() => "unknown");
-  const method = await detectInstallMethod(pi);
-  const spec = commandFor(method);
+  const updateArgs = ["update", ...parseArgs(args)];
+  const label = `pi ${updateArgs.join(" ")}`;
 
-  if (!spec) {
-    ctx.ui.notify(`Pi ${before}; install method appears native. Please update the native binary manually.`, "warning");
+  ctx.ui.notify(`Updating with built-in command: ${label}`, "info");
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const result = await pi.exec("pi", updateArgs, { timeout: 300_000 });
+    const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+
+    if (result.code !== 0) {
+      if (attempt === 1 && needsPnpmBuildApproval(output) && (await askForPnpmBuildApprovals(pi, ctx))) {
+        ctx.ui.notify(`Retrying ${label} after pnpm build approvals`, "info");
+        continue;
+      }
+
+      const approvalHint = needsPnpmBuildApproval(output)
+        ? "\n\nPnpm appears to need build approval. Run `/update` again and enter the packages to approve, or run `pnpm approve-builds` manually."
+        : "";
+      ctx.ui.notify(`Pi update failed. ${compactOutput(output)}${approvalHint}`, "error");
+      return;
+    }
+
+    const after = await currentVersion(pi).catch(() => "unknown");
+    const changed = before !== after && before !== "unknown" && after !== "unknown";
+    const summary = changed ? `Pi updated: ${before} → ${after}` : `Pi update completed (${after}).`;
+    ctx.ui.notify(`${summary}\n${compactOutput(output)}`, "info");
     return;
   }
-
-  ctx.ui.notify(`Updating Pi via ${method}: ${spec.label}`, "info");
-  const result = await runWithRetry(pi, spec);
-  const after = await currentVersion(pi).catch(() => "unknown");
-
-  if (!result.ok) {
-    ctx.ui.notify(`Pi update failed after ${result.attempts} attempt(s). ${result.output || "No output."}`, "error");
-    return;
-  }
-
-  const changed = before !== after && before !== "unknown" && after !== "unknown";
-  const summary = changed ? `Pi updated: ${before} → ${after}` : `Pi is up to date (${after}).`;
-  ctx.ui.notify(`${summary}${result.attempts > 1 ? ` Retried ${result.attempts - 1} transient failure(s).` : ""}`, "info");
 }
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("update", {
-    description: "Update Pi using the detected install method, then report the version change",
+    description: "Run the built-in `pi update` command on startup",
     type: "boolean",
     default: false,
   });
 
   pi.registerCommand("update", {
-    description: "Update Pi using vp, pnpm, bun, npm, brew, or native detection",
-    handler: async (_args, ctx) => {
-      await updatePi(pi, ctx);
+    description: "Run the built-in `pi update` command. Extra args are passed through, e.g. `/update --self`.",
+    handler: async (args, ctx) => {
+      await updatePi(pi, ctx, args);
     },
   });
 
