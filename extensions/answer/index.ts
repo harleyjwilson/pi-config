@@ -57,6 +57,9 @@ Rules:
 - Keep questions in the order they appeared
 - Be concise with question text
 - Include context only when it provides essential information for answering
+- In numbered lists, include wrapped continuation lines as part of the same question
+- If a numbered item is only a section heading and its bullets are questions, extract each bullet as a question and use the heading as context
+- Treat text like "Templates: should templates be project-level only..." as a question even if it has no trailing question mark
 - If no questions are found, return {"questions": []}
 
 Example output:
@@ -125,6 +128,97 @@ function parseExtractionResult(text: string): ExtractionResult | null {
 	} catch {
 		return null;
 	}
+}
+
+const QUESTION_START_RE = /^(?:can|could|do|does|did|should|would|will|what|when|where|which|who|why|how|is|are|am|was|were)\b/i;
+const NUMBERED_ITEM_RE = /^\s*\d+[.)]\s+(.*)$/;
+const BULLET_ITEM_RE = /^\s*[-*+]\s+(.*)$/;
+
+function normalizeQuestionText(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+function looksLikeQuestion(text: string): boolean {
+	const normalized = normalizeQuestionText(text);
+	if (!normalized) return false;
+	if (normalized.includes("?")) return true;
+
+	const withoutLeadingLabel = normalized.replace(/^[^:]{1,80}:\s*/, "");
+	return QUESTION_START_RE.test(withoutLeadingLabel);
+}
+
+/**
+ * Fast local extraction for structured numbered/bulleted question lists.
+ *
+ * LLM extraction can be unreliable for messages like:
+ *   3. Postgres config:
+ *      - Should I create a .env-based setup?
+ *      - What DB name/user/password/host/port should be default?
+ *
+ * This parser preserves order, handles wrapped numbered items, and treats bullets under
+ * a non-question heading as their own questions with the heading as context.
+ */
+function extractStructuredQuestionList(text: string): ExtractionResult | null {
+	const questions: ExtractedQuestion[] = [];
+	const lines = text.replace(/\r\n/g, "\n").split("\n");
+	let currentNumbered: { text: string; bullets: string[] } | null = null;
+	let currentBulletIndex: number | null = null;
+
+	const flushCurrent = () => {
+		if (!currentNumbered) return;
+
+		const heading = normalizeQuestionText(currentNumbered.text);
+		if (currentNumbered.bullets.length > 0) {
+			for (const bullet of currentNumbered.bullets) {
+				const bulletText = normalizeQuestionText(bullet);
+				if (!looksLikeQuestion(bulletText)) continue;
+
+				if (looksLikeQuestion(heading)) {
+					questions.push({ question: bulletText, context: heading });
+				} else {
+					questions.push({ question: bulletText, context: heading.replace(/:$/, "") });
+				}
+			}
+		} else if (looksLikeQuestion(heading)) {
+			questions.push({ question: heading });
+		}
+
+		currentNumbered = null;
+		currentBulletIndex = null;
+	};
+
+	for (const rawLine of lines) {
+		const numberedMatch = rawLine.match(NUMBERED_ITEM_RE);
+		if (numberedMatch) {
+			flushCurrent();
+			currentNumbered = { text: numberedMatch[1], bullets: [] };
+			continue;
+		}
+
+		if (!currentNumbered) continue;
+
+		const bulletMatch = rawLine.match(BULLET_ITEM_RE);
+		if (bulletMatch) {
+			currentNumbered.bullets.push(bulletMatch[1]);
+			currentBulletIndex = currentNumbered.bullets.length - 1;
+			continue;
+		}
+
+		const continuation = rawLine.trim();
+		if (!continuation) continue;
+
+		if (currentBulletIndex !== null) {
+			currentNumbered.bullets[currentBulletIndex] += ` ${continuation}`;
+		} else if (/^\s+/.test(rawLine)) {
+			currentNumbered.text += ` ${continuation}`;
+		} else {
+			flushCurrent();
+		}
+	}
+
+	flushCurrent();
+
+	return questions.length > 0 ? { questions } : null;
 }
 
 /**
@@ -450,66 +544,72 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Select the best model for extraction (prefer Codex mini, then haiku)
-			const extractionModel = await selectExtractionModel(ctx.model, ctx.modelRegistry);
+			let extractionResult = extractStructuredQuestionList(lastAssistantText);
+			let extractionOutcome: ExtractionOutcome = { result: extractionResult };
 
-			// Run extraction with loader UI
-			const extractionOutcome = await ctx.ui.custom<ExtractionOutcome>((tui, theme, _kb, done) => {
-				const loader = new BorderedLoader(tui, theme, `Extracting questions using ${extractionModel.id}...`);
-				loader.onAbort = () => done({ result: null });
+			if (!extractionResult) {
+				// Select the best model for extraction (prefer Codex mini, then haiku) only when
+				// the message is not a structured numbered/bulleted list we can parse locally.
+				const extractionModel = await selectExtractionModel(ctx.model, ctx.modelRegistry);
 
-				const doExtract = async () => {
-					const auth = await ctx.modelRegistry.getApiKeyAndHeaders(extractionModel);
-					if (!auth.ok) {
-						throw new Error(auth.error);
-					}
-					const userMessage: UserMessage = {
-						role: "user",
-						content: [{ type: "text", text: lastAssistantText! }],
-						timestamp: Date.now(),
+				// Run extraction with loader UI
+				extractionOutcome = await ctx.ui.custom<ExtractionOutcome>((tui, theme, _kb, done) => {
+					const loader = new BorderedLoader(tui, theme, `Extracting questions using ${extractionModel.id}...`);
+					loader.onAbort = () => done({ result: null });
+
+					const doExtract = async () => {
+						const auth = await ctx.modelRegistry.getApiKeyAndHeaders(extractionModel);
+						if (!auth.ok) {
+							throw new Error(auth.error);
+						}
+						const userMessage: UserMessage = {
+							role: "user",
+							content: [{ type: "text", text: lastAssistantText! }],
+							timestamp: Date.now(),
+						};
+
+						const response = await complete(
+							extractionModel,
+							{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
+							{ apiKey: auth.apiKey, headers: auth.headers, signal: loader.signal },
+						);
+
+						if (response.stopReason === "aborted") {
+							return null;
+						}
+
+						const responseText = response.content
+							.filter((c): c is { type: "text"; text: string } => c.type === "text")
+							.map((c) => c.text)
+							.join("\n");
+
+						const parsed = parseExtractionResult(responseText);
+						if (!parsed) {
+							throw new Error("Question extraction returned invalid JSON");
+						}
+
+						return parsed;
 					};
 
-					const response = await complete(
-						extractionModel,
-						{ systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
-						{ apiKey: auth.apiKey, headers: auth.headers, signal: loader.signal },
-					);
+					doExtract()
+						.then((result) => done({ result }))
+						.catch((error: unknown) =>
+							done({
+								result: null,
+								error: error instanceof Error ? error.message : String(error),
+							}),
+						);
 
-					if (response.stopReason === "aborted") {
-						return null;
-					}
-
-					const responseText = response.content
-						.filter((c): c is { type: "text"; text: string } => c.type === "text")
-						.map((c) => c.text)
-						.join("\n");
-
-					const parsed = parseExtractionResult(responseText);
-					if (!parsed) {
-						throw new Error("Question extraction returned invalid JSON");
-					}
-
-					return parsed;
-				};
-
-				doExtract()
-					.then((result) => done({ result }))
-					.catch((error: unknown) =>
-						done({
-							result: null,
-							error: error instanceof Error ? error.message : String(error),
-						}),
-					);
-
-				return loader;
-			});
+					return loader;
+				});
+			}
 
 			if (extractionOutcome.error) {
 				ctx.ui.notify(`Question extraction failed: ${extractionOutcome.error}`, "error");
 				return;
 			}
 
-			const extractionResult = extractionOutcome.result;
+			extractionResult = extractionOutcome.result;
 			if (extractionResult === null) {
 				ctx.ui.notify("Cancelled", "info");
 				return;
