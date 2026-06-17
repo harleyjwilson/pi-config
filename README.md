@@ -31,7 +31,6 @@ Loaded on demand when relevant.
 | Skill                         | Purpose                                                                |
 | ----------------------------- | ---------------------------------------------------------------------- |
 | **commit**                    | Instructions for making git commits                                    |
-| **frontend-design**           | Guidance for designing and building polished frontend UIs              |
 | **librarian**                 | Cache and refresh remote git repositories for local reference          |
 | **svelte-code-writer**        | Svelte 5 documentation lookup and component/module analysis            |
 | **svelte-core-bestpractices** | Guidance for robust modern Svelte code                                 |
@@ -69,6 +68,6 @@ Loaded on demand when relevant.
 
 Extensions and skills in this config are adapted from or inspired by these projects:
 
-- [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff) — source/inspiration for `answer`, `files`, `review`, `todos`, `uv`, plus the `commit`, `frontend-design`, and `uv` skills.
+- [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff) — source/inspiration for `answer`, `files`, `review`, `todos`, `uv`, plus the `commit`, and `uv` skills.
 - [badlogic/pi-skills](https://github.com/badlogic/pi-skills) — source/inspiration for `youtube-transcipt` and `brave-search` extensions.
 - [davis7dotsh/my-pi-setup](https://github.com/davis7dotsh/my-pi-setup) — source/inspiration for the `update` extension.
