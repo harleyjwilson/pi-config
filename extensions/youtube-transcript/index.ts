@@ -1,5 +1,5 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { fetchTranscript } from "youtube-transcript-plus";
 
 const USER_AGENT =
@@ -42,6 +42,12 @@ function decodeHtmlEntities(text: string) {
     if (hex) return String.fromCodePoint(Number.parseInt(hex, 16));
     return ({ "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&apos;": "'", "&#39;": "'" } as Record<string, string>)[entity] ?? entity;
   });
+}
+
+function truncateToolText(text: string) {
+  const truncated = truncateHead(text, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+  if (!truncated.truncated) return truncated.content;
+  return `${truncated.content}\n\n[Transcript truncated: ${truncated.outputLines} of ${truncated.totalLines} lines (${formatSize(truncated.outputBytes)} of ${formatSize(truncated.totalBytes)})]`;
 }
 
 function extractVideoId(input: string) {
@@ -124,7 +130,7 @@ async function fetchTranscriptWithFallback(
     } as any)) as TranscriptResult;
     return { result, warning: undefined as string | undefined };
   } catch (error) {
-    if (!options.lang) throw error;
+    if (options.signal?.aborted || !options.lang) throw error;
 
     const tracks = await getCaptionTracks(videoId, { userAgent: USER_AGENT, signal: options.signal });
     const availableLanguages = tracks.map((track) => track.languageCode).filter(Boolean) as string[];
@@ -150,6 +156,9 @@ async function getTranscript(params: {
   signal?: AbortSignal;
 }) {
   const videoId = extractVideoId(params.video);
+  if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+    throw new Error("Invalid YouTube video ID or URL");
+  }
   const lang = normalizeLanguage(params.lang);
 
   if (params.listOnly) {
@@ -185,7 +194,7 @@ async function getTranscript(params: {
 
   return {
     videoId,
-    text: warning ? `${warning}\n\n${text}` : text,
+    text: truncateToolText(warning ? `${warning}\n\n${text}` : text),
     details: {
       videoId,
       lang,
@@ -229,11 +238,7 @@ export default function (pi: ExtensionAPI) {
           details: result.details,
         };
       } catch (error) {
-        return {
-          content: [{ type: "text", text: `Error fetching YouTube transcript: ${asErrorMessage(error)}` }],
-          details: { error: asErrorMessage(error) },
-          isError: true,
-        };
+        throw new Error(`Error fetching YouTube transcript: ${asErrorMessage(error)}`);
       }
     },
   });

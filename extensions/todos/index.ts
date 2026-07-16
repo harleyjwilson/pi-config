@@ -5,7 +5,7 @@
  *
  * File format in .pi/todos:
  * - The file starts with a JSON object (not YAML) containing the front matter:
- *   { id, title, tags, status, created_at, assigned_to_session }
+ *   { id, title, tags, status, created_at, closed_at, assigned_to_session }
  * - After the JSON block comes optional markdown body text separated by a blank line.
  * - Example:
  *   {
@@ -14,6 +14,7 @@
  *     "tags": ["qa"],
  *     "status": "open",
  *     "created_at": "2026-01-25T17:00:00.000Z",
+ *     "closed_at": "2026-01-26T17:00:00.000Z",
  *     "assigned_to_session": "session.json"
  *   }
  *
@@ -23,15 +24,15 @@
  * Defaults:
  * {
  *   "gc": true,   // delete closed todos older than gcDays on startup
- *   "gcDays": 7   // age threshold for GC (days since created_at)
+ *   "gcDays": 7   // age threshold for GC (days since closed_at)
  * }
  *
  * Use `/todos` to bring up the visual todo manager or just let the LLM use them
  * naturally.
  */
-import { DynamicBorder, copyToClipboard, getMarkdownTheme, keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { Type } from "@sinclair/typebox";
+import { DynamicBorder, copyToClipboard, getMarkdownTheme, keyHint, withFileMutationQueue, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
@@ -51,7 +52,7 @@ import {
 	matchesKey,
 	truncateToWidth,
 	visibleWidth,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 
 const TODO_DIR_NAME = ".pi/todos";
 const TODO_PATH_ENV = "PI_TODO_PATH";
@@ -70,6 +71,7 @@ interface TodoFrontMatter {
 	tags: string[];
 	status: string;
 	created_at: string;
+	closed_at?: string;
 	assigned_to_session?: string;
 }
 
@@ -784,9 +786,9 @@ async function garbageCollectTodos(todosDir: string, settings: TodoSettings): Pr
 					const { frontMatter } = splitFrontMatter(content);
 					const parsed = parseFrontMatter(frontMatter, id);
 					if (!isTodoClosed(parsed.status)) return;
-					const createdAt = Date.parse(parsed.created_at);
-					if (!Number.isFinite(createdAt)) return;
-					if (createdAt < cutoff) {
+					const closedAt = Date.parse(parsed.closed_at ?? "");
+					if (!Number.isFinite(closedAt)) return;
+					if (closedAt < cutoff) {
 						await fs.unlink(filePath);
 					}
 				} catch {
@@ -811,6 +813,7 @@ function parseFrontMatter(text: string, idFallback: string): TodoFrontMatter {
 		tags: [],
 		status: "open",
 		created_at: "",
+		closed_at: undefined,
 		assigned_to_session: undefined,
 	};
 
@@ -824,6 +827,7 @@ function parseFrontMatter(text: string, idFallback: string): TodoFrontMatter {
 		if (typeof parsed.title === "string") data.title = parsed.title;
 		if (typeof parsed.status === "string" && parsed.status) data.status = parsed.status;
 		if (typeof parsed.created_at === "string") data.created_at = parsed.created_at;
+		if (typeof parsed.closed_at === "string") data.closed_at = parsed.closed_at;
 		if (typeof parsed.assigned_to_session === "string" && parsed.assigned_to_session.trim()) {
 			data.assigned_to_session = parsed.assigned_to_session;
 		}
@@ -916,6 +920,7 @@ function serializeTodo(todo: TodoRecord): string {
 			tags: todo.tags ?? [],
 			status: todo.status,
 			created_at: todo.created_at,
+			closed_at: todo.closed_at || undefined,
 			assigned_to_session: todo.assigned_to_session || undefined,
 		},
 		null,
@@ -1020,13 +1025,15 @@ async function withTodoLock<T>(
 	ctx: ExtensionContext,
 	fn: () => Promise<T>,
 ): Promise<T | { error: string }> {
-	const lock = await acquireLock(todosDir, id, ctx);
-	if (typeof lock === "object" && "error" in lock) return lock;
-	try {
-		return await fn();
-	} finally {
-		await lock();
-	}
+	return withFileMutationQueue(getTodoPath(todosDir, id), async () => {
+		const lock = await acquireLock(todosDir, id, ctx);
+		if (typeof lock === "object" && "error" in lock) return lock;
+		try {
+			return await fn();
+		} finally {
+			await lock();
+		}
+	});
 }
 
 async function listTodos(todosDir: string): Promise<TodoFrontMatter[]> {
@@ -1286,11 +1293,19 @@ async function appendTodoBody(filePath: string, todo: TodoRecord, text: string):
 	return todo;
 }
 
+function ensureTodoMutationAllowed(todo: TodoRecord, ctx: ExtensionContext, force = false): string | null {
+	if (todo.assigned_to_session && todo.assigned_to_session !== ctx.sessionManager.getSessionId() && !force) {
+		return `Todo ${displayTodoId(todo.id)} is assigned to session ${todo.assigned_to_session}. Claim it with force before changing it.`;
+	}
+	return null;
+}
+
 async function updateTodoStatus(
 	todosDir: string,
 	id: string,
 	status: string,
 	ctx: ExtensionContext,
+	force = false,
 ): Promise<TodoRecord | { error: string }> {
 	const validated = validateTodoId(id);
 	if ("error" in validated) {
@@ -1305,7 +1320,10 @@ async function updateTodoStatus(
 	const result = await withTodoLock(todosDir, normalizedId, ctx, async () => {
 		const existing = await ensureTodoExists(filePath, normalizedId);
 		if (!existing) return { error: `Todo ${displayTodoId(id)} not found` } as const;
+		const mutationError = ensureTodoMutationAllowed(existing, ctx, force);
+		if (mutationError) return { error: mutationError } as const;
 		existing.status = status;
+		existing.closed_at = isTodoClosed(status) ? new Date().toISOString() : undefined;
 		clearAssignmentIfClosed(existing);
 		await writeTodoFile(filePath, existing);
 		return existing;
@@ -1404,6 +1422,7 @@ async function deleteTodo(
 	todosDir: string,
 	id: string,
 	ctx: ExtensionContext,
+	force = false,
 ): Promise<TodoRecord | { error: string }> {
 	const validated = validateTodoId(id);
 	if ("error" in validated) {
@@ -1418,6 +1437,8 @@ async function deleteTodo(
 	const result = await withTodoLock(todosDir, normalizedId, ctx, async () => {
 		const existing = await ensureTodoExists(filePath, normalizedId);
 		if (!existing) return { error: `Todo ${displayTodoId(id)} not found` } as const;
+		const mutationError = ensureTodoMutationAllowed(existing, ctx, force);
+		if (mutationError) return { error: mutationError } as const;
 		await fs.unlink(filePath);
 		return existing;
 	});
@@ -1520,6 +1541,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 						tags: params.tags ?? [],
 						status: params.status ?? "open",
 						created_at: new Date().toISOString(),
+						closed_at: isTodoClosed(params.status ?? "open") ? new Date().toISOString() : undefined,
 						body: params.body ?? "",
 					};
 
@@ -1567,10 +1589,15 @@ export default function todosExtension(pi: ExtensionAPI) {
 					const result = await withTodoLock(todosDir, normalizedId, ctx, async () => {
 						const existing = await ensureTodoExists(filePath, normalizedId);
 						if (!existing) return { error: `Todo ${displayId} not found` } as const;
+						const mutationError = ensureTodoMutationAllowed(existing, ctx, Boolean(params.force));
+						if (mutationError) return { error: mutationError } as const;
 
 						existing.id = normalizedId;
 						if (params.title !== undefined) existing.title = params.title;
-						if (params.status !== undefined) existing.status = params.status;
+						if (params.status !== undefined) {
+							existing.status = params.status;
+							existing.closed_at = isTodoClosed(params.status) ? new Date().toISOString() : undefined;
+						}
 						if (params.tags !== undefined) existing.tags = params.tags;
 						if (params.body !== undefined) existing.body = params.body;
 						if (!existing.created_at) existing.created_at = new Date().toISOString();
@@ -1620,6 +1647,8 @@ export default function todosExtension(pi: ExtensionAPI) {
 					const result = await withTodoLock(todosDir, normalizedId, ctx, async () => {
 						const existing = await ensureTodoExists(filePath, normalizedId);
 						if (!existing) return { error: `Todo ${displayId} not found` } as const;
+						const mutationError = ensureTodoMutationAllowed(existing, ctx, Boolean(params.force));
+						if (mutationError) return { error: mutationError } as const;
 						if (!params.body || !params.body.trim()) {
 							return existing;
 						}
@@ -1708,7 +1737,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 							details: { action: "delete", error: validated.error },
 						};
 					}
-					const result = await deleteTodo(todosDir, validated.id, ctx);
+					const result = await deleteTodo(todosDir, validated.id, ctx, Boolean(params.force));
 					if (typeof result === "object" && "error" in result) {
 						return {
 							content: [{ type: "text", text: result.error }],

@@ -20,19 +20,22 @@
  * blocks disallowed invocations at bash spawn time.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createBashTool } from "@mariozechner/pi-coding-agent";
-import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createBashTool } from "@earendil-works/pi-coding-agent";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const interceptedCommandsPath = join(__dirname, "..", "..", "intercepted-commands");
 
 function getBlockedCommandMessage(command: string): string | null {
   // Match commands at the start of a shell segment (start/newline/; /&& /|| /|)
-  const pipCommandPattern = /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?pip\s*(?:$|\s)/m;
-  const pip3CommandPattern = /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?pip3\s*(?:$|\s)/m;
-  const poetryCommandPattern = /(?:^|\n|[;|&]{1,2})\s*(?:\S+\/)?poetry\s*(?:$|\s)/m;
+  // Best-effort shell-text gate. PATH shims remain the primary enforcement;
+  // commands embedded in shell syntax cannot be parsed safely with regex alone.
+  const commandPrefix = "(?:^|\\n|[;|&]{1,2})\\s*(?:(?:command|env|sudo)\\s+)*(?:\\S+\\/)?";
+  const pipCommandPattern = new RegExp(`${commandPrefix}pip\\s*(?:$|\\s)`, "m");
+  const pip3CommandPattern = new RegExp(`${commandPrefix}pip3\\s*(?:$|\\s)`, "m");
+  const poetryCommandPattern = new RegExp(`${commandPrefix}poetry\\s*(?:$|\\s)`, "m");
 
   // Match python invocations including explicit paths like .venv/bin/python
   // and .venv/bin/python3.12.

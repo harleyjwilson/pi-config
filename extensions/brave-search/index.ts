@@ -1,13 +1,15 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { StringEnum } from "@mariozechner/pi-ai";
-import { Type } from "@sinclair/typebox";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 
 type BraveSource = "web" | "news" | "images";
 
@@ -44,6 +46,7 @@ function writeAuthFile(auth: Record<string, any>) {
   // ~/.pi/agent already exists for normal pi installations, but keep this robust.
   if (!existsSync(dirname(path))) throw new Error(`Missing auth directory: ${dirname(path)}`);
   writeFileSync(path, `${JSON.stringify(auth, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
 }
 
 function getStoredBraveApiKey() {
@@ -89,6 +92,47 @@ function abortSignal(timeoutMs: number, parent?: AbortSignal) {
   return AbortSignal.timeout(timeoutMs);
 }
 
+function isPrivateAddress(address: string) {
+  if (isIP(address) === 4) {
+    const [a, b] = address.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168);
+  }
+  const normalized = address.toLowerCase();
+  if (normalized.startsWith("::ffff:")) {
+    return isPrivateAddress(normalized.slice("::ffff:".length));
+  }
+  return normalized === "::1" || normalized === "::" || normalized.startsWith("fc") ||
+    normalized.startsWith("fd") || normalized.startsWith("fe80:");
+}
+
+async function assertSafePublicUrl(value: string) {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("Only HTTP(S) URLs may be scraped");
+  }
+  if (url.username || url.password || url.hostname === "localhost" || url.hostname.endsWith(".localhost")) {
+    throw new Error("Local URLs may not be scraped");
+  }
+  const records = await lookup(url.hostname, { all: true, verbatim: true });
+  if (records.length === 0 || records.some((record) => isPrivateAddress(record.address))) {
+    throw new Error("Private-network URLs may not be scraped");
+  }
+  return url;
+}
+
+function truncateToolText(text: string) {
+  const truncated = truncateHead(text, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+  if (!truncated.truncated) return truncated.content;
+  return `${truncated.content}\n\n[Output truncated: ${truncated.outputLines} of ${truncated.totalLines} lines (${formatSize(truncated.outputBytes)} of ${formatSize(truncated.totalBytes)})]`;
+}
+
 function htmlToMarkdown(html: string) {
   const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
   turndown.use(gfm);
@@ -110,15 +154,25 @@ function htmlToMarkdown(html: string) {
 async function scrapePage(url: string, options: { timeout?: number; maxChars?: number; signal?: AbortSignal } = {}) {
   const timeout = options.timeout ?? 30000;
   const maxChars = options.maxChars ?? 20000;
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-    signal: abortSignal(timeout, options.signal),
-  });
-
+  let currentUrl = (await assertSafePublicUrl(url)).toString();
+  let response: Response | undefined;
+  for (let redirectCount = 0; redirectCount < 5; redirectCount += 1) {
+    response = await fetch(currentUrl, {
+      redirect: "manual",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      signal: abortSignal(timeout, options.signal),
+    });
+    if (response.status < 300 || response.status >= 400) break;
+    const location = response.headers.get("location");
+    if (!location) throw new Error("Redirect response missing Location header");
+    currentUrl = (await assertSafePublicUrl(new URL(location, currentUrl).toString())).toString();
+  }
+  if (!response) throw new Error("Failed to fetch URL");
+  if (response.status >= 300 && response.status < 400) throw new Error("Too many redirects");
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
 
   const contentType = response.headers.get("content-type") ?? "";
@@ -127,7 +181,7 @@ async function scrapePage(url: string, options: { timeout?: number; maxChars?: n
   }
 
   const html = await response.text();
-  const dom = new JSDOM(html, { url });
+  const dom = new JSDOM(html, { url: currentUrl });
   const reader = new Readability(dom.window.document);
   const article = reader.parse();
 
@@ -137,7 +191,7 @@ async function scrapePage(url: string, options: { timeout?: number; maxChars?: n
   if (article?.content) {
     markdown = htmlToMarkdown(article.content);
   } else {
-    const fallbackDoc = new JSDOM(html, { url });
+    const fallbackDoc = new JSDOM(html, { url: currentUrl });
     const doc = fallbackDoc.window.document;
     doc.querySelectorAll("script, style, noscript, nav, header, footer, aside").forEach((el) => el.remove());
     const main = doc.querySelector("main, article, [role='main'], .content, #content") || doc.body;
@@ -147,7 +201,7 @@ async function scrapePage(url: string, options: { timeout?: number; maxChars?: n
   if (!markdown || markdown.length < 100) throw new Error("Could not extract readable page content");
   if (markdown.length > maxChars) markdown = `${markdown.slice(0, maxChars)}\n\n…truncated to ${maxChars} characters.`;
 
-  return { title, url, markdown, length: markdown.length };
+  return { title, url: currentUrl, markdown, length: markdown.length };
 }
 
 async function braveSearch(params: {
@@ -263,15 +317,11 @@ export default function (pi: ExtensionAPI) {
         }
 
         return {
-          content: [{ type: "text", text: formatSearchResults(search.results) }],
+          content: [{ type: "text", text: truncateToolText(formatSearchResults(search.results)) }],
           details: search,
         };
       } catch (error) {
-        return {
-          content: [{ type: "text", text: `Brave search failed: ${asErrorMessage(error)}` }],
-          details: { error: asErrorMessage(error) },
-          isError: true,
-        };
+        throw new Error(`Brave search failed: ${asErrorMessage(error)}`);
       }
     },
   });
@@ -299,15 +349,11 @@ export default function (pi: ExtensionAPI) {
           : "";
 
         return {
-          content: [{ type: "text", text: `# ${page.title}\n\n${page.markdown}${metadata}` }],
+          content: [{ type: "text", text: truncateToolText(`# ${page.title}\n\n${page.markdown}${metadata}`) }],
           details: page,
         };
       } catch (error) {
-        return {
-          content: [{ type: "text", text: `Brave scrape failed: ${asErrorMessage(error)}` }],
-          details: { error: asErrorMessage(error) },
-          isError: true,
-        };
+        throw new Error(`Brave scrape failed: ${asErrorMessage(error)}`);
       }
     },
   });

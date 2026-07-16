@@ -31,8 +31,8 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   ExtensionCommandContext,
-} from "@mariozechner/pi-coding-agent";
-import { DynamicBorder, BorderedLoader } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, BorderedLoader } from "@earendil-works/pi-coding-agent";
 import {
   Container,
   fuzzyFilter,
@@ -41,7 +41,7 @@ import {
   SelectList,
   Spacer,
   Text,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 
@@ -998,10 +998,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
     applyAllReviewState(ctx);
   });
 
-  pi.on("session_switch", (_event, ctx) => {
-    applyAllReviewState(ctx);
-  });
-
   pi.on("session_tree", (_event, ctx) => {
     applyAllReviewState(ctx);
   });
@@ -1127,6 +1123,12 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
       if (result === TOGGLE_LOOP_FIXING_VALUE) {
         const nextEnabled = !reviewLoopFixingEnabled;
+        if (nextEnabled && !(await ctx.ui.confirm(
+          "Enable loop fixing?",
+          "Loop fixing can ask the agent to edit code repeatedly until review findings are resolved. Continue?",
+        ))) {
+          continue;
+        }
         setReviewLoopFixingEnabled(nextEnabled);
         ctx.ui.notify(
           nextEnabled ? "Loop fixing enabled" : "Loop fixing disabled",
@@ -1543,6 +1545,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
       return null;
     }
 
+    if (!(await ctx.ui.confirm(
+      "Checkout pull request?",
+      `This will change the current working tree to PR #${prNumber}: ${prInfo.title}. Continue?`,
+    ))) return null;
+
     // Checkout the PR
     ctx.ui.notify(`Checking out PR #${prNumber}...`, "info");
     const checkoutResult = await checkoutPr(pi, prNumber);
@@ -1833,6 +1840,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
       );
       return null;
     }
+
+    if (!(await ctx.ui.confirm(
+      "Checkout pull request?",
+      `This will change the current working tree to PR #${prNumber}: ${prInfo.title}. Continue?`,
+    ))) return null;
 
     // Checkout the PR
     ctx.ui.notify(`Checking out PR #${prNumber}...`, "info");

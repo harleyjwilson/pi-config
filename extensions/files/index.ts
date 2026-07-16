@@ -22,8 +22,8 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   SessionEntry,
-} from "@mariozechner/pi-coding-agent";
-import { DynamicBorder } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import {
   Container,
   fuzzyFilter,
@@ -36,7 +36,7 @@ import {
   truncateToWidth,
   type TUI,
   visibleWidth,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 
 type ContentBlock = {
   type?: string;
@@ -779,6 +779,11 @@ const openPath = async (
   }
 };
 
+const parseEditorCommand = (command: string): string[] => {
+  const parts = command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
+  return parts.map((part) => part.replace(/^(?:"|')|(?:"|')$/g, ""));
+};
+
 const openExternalEditor = (
   tui: TUI,
   editorCmd: string,
@@ -790,13 +795,14 @@ const openExternalEditor = (
     writeFileSync(tmpFile, content, "utf8");
     tui.stop();
 
-    const [editor, ...editorArgs] = editorCmd.split(" ");
+    const [editor, ...editorArgs] = parseEditorCommand(editorCmd);
+    if (!editor) return null;
     const result = spawnSync(editor, [...editorArgs, tmpFile], {
       stdio: "inherit",
     });
 
     if (result.status === 0) {
-      return readFileSync(tmpFile, "utf8").replace(/\n$/, "");
+      return readFileSync(tmpFile, "utf8");
     }
 
     return null;
@@ -839,7 +845,9 @@ const editPath = async (
   }
 
   try {
-    writeFileSync(target.resolvedPath, updated, "utf8");
+    await withFileMutationQueue(target.resolvedPath, async () => {
+      writeFileSync(target.resolvedPath, updated, "utf8");
+    });
   } catch {
     ctx.ui.notify(`Failed to save ${target.displayPath}`, "error");
   }
@@ -997,7 +1005,7 @@ const renderDiffOverlay = async (
   await renderTextOverlay(
     ctx,
     title,
-    "git diff via delta -- " + title,
+    "git diff -- " + title,
     diffText,
     "No git diff for this file.",
   );
@@ -1023,8 +1031,12 @@ const openDiff = async (
     80,
     Math.floor(((process.stdout.columns || 120) * 98) / 100) - 4,
   );
-  const runDeltaDiff = (args: string[]) =>
-    pi.exec(
+  const deltaAvailable = (await pi.exec("delta", ["--version"], { cwd: gitRoot })).code === 0;
+  const runDeltaDiff = (args: string[]) => {
+    if (!deltaAvailable) {
+      return pi.exec("git", ["diff", "--color=always", ...args, "--", relativePath], { cwd: gitRoot });
+    }
+    return pi.exec(
       "bash",
       [
         "-o",
@@ -1038,6 +1050,7 @@ const openDiff = async (
       ],
       { cwd: gitRoot },
     );
+  };
 
   const unstaged = await runDeltaDiff([]);
   if (unstaged.code !== 0) {

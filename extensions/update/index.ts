@@ -49,6 +49,12 @@ async function askForPnpmBuildApprovals(pi: ExtensionAPI, ctx: ExtensionCommandC
 async function updatePi(pi: ExtensionAPI, ctx: ExtensionCommandContext, args = "") {
   await ctx.waitForIdle();
 
+  if (!ctx.hasUI) {
+    console.log("Refusing to update Pi without an interactive confirmation.");
+    return;
+  }
+  if (!(await ctx.ui.confirm("Update Pi?", "Run the built-in pi update command now?"))) return;
+
   const before = await currentVersion(pi).catch(() => "unknown");
   const updateArgs = ["update", ...parseArgs(args)];
   const label = `pi ${updateArgs.join(" ")}`;
