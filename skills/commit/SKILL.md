@@ -7,18 +7,19 @@ Create a git commit for the current changes using a concise Conventional Commits
 
 ## Format
 
-`<type>(<scope>): <summary>`
+`<type>(<scope>): <summary>` or, without a scope, `<type>: <summary>`
 
 - `type` REQUIRED. Use `feat` for new features, `fix` for bug fixes. Other common types: `docs`, `refactor`, `chore`, `test`, `perf`.
-- `scope` OPTIONAL. Short noun in parentheses for the affected area (e.g., `api`, `parser`, `ui`).
+- `scope` OPTIONAL. Use a short noun for the affected area (e.g., `api`, `parser`, `ui`).
 - `summary` REQUIRED. Short, imperative, <= 72 chars, no trailing period.
 
 ## Notes
 
 - Body is OPTIONAL. If needed, add a blank line after the subject and write short paragraphs.
-- Do NOT include breaking-change markers or footers.
+- Accurately represent breaking changes when applicable, following the repository's established convention.
 - Do NOT add sign-offs (no `Signed-off-by`).
 - Only commit; do NOT push.
+- Preserve and run repository commit hooks; do not bypass them unless the user explicitly asks.
 - If it is unclear whether a file should be included, ask the user which files to commit.
 - Treat any caller-provided arguments as additional commit guidance. Common patterns:
   - Freeform instructions should influence scope, summary, and body.
@@ -27,9 +28,11 @@ Create a git commit for the current changes using a concise Conventional Commits
 
 ## Steps
 
-1. Infer from the prompt if the user provided specific file paths/globs and/or additional instructions.
-2. Review `git status` and `git diff` to understand the current changes (limit to argument-specified files if provided).
-3. (Optional) Run `git log -n 50 --pretty=format:%s` to see commonly used scopes.
-4. If there are ambiguous extra files, ask the user for clarification before committing.
-5. Stage only the intended files (all changes if no files specified).
-6. Run `git commit -m "<subject>"` (and `-m "<body>"` if needed).
+1. Infer from the prompt whether the user supplied paths/globs and/or commit-message guidance.
+2. Review `git status --short`, `git diff --cached`, and `git diff` separately. Never assume pre-staged changes are related to unstaged changes.
+3. Stop and ask if there are unrelated staged changes, ambiguous extra files, or an unclear target set. If there are no intended changes, report that and do not create an empty commit.
+4. Run `git diff --check` for the intended changes. Check for an in-progress merge, rebase, or cherry-pick before proceeding.
+5. (Optional) Run `git log -n 50 --pretty=format:%s` to follow local scope and message conventions.
+6. Stage only the intended files. For path-limited commits, use `git add -A -- <paths>` so additions, modifications, and deletions are all included. Do not stage every change merely because some changes were already staged.
+7. Run `git commit -m "<subject>"` (and `-m "<body>"` if needed), without bypassing hooks.
+8. Verify success with `git status --short` and `git log -1 --format=%s`.

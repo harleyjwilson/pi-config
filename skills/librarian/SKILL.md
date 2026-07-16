@@ -22,22 +22,24 @@ Example:
 
 ## Command
 
+Resolve this skill's directory first, then invoke its script by absolute path (do not assume the current working directory):
+
 ```bash
-bash checkout.sh <repo> --path-only
+bash /absolute/path/to/skills/librarian/checkout.sh <repo> --path-only
 ```
 
 Examples:
 
 ```bash
-bash checkout.sh mitsuhiko/minijinja --path-only
-bash checkout.sh github.com/mitsuhiko/minijinja --path-only
-bash checkout.sh https://github.com/mitsuhiko/minijinja --path-only
+bash /absolute/path/to/skills/librarian/checkout.sh mitsuhiko/minijinja --path-only
+bash /absolute/path/to/skills/librarian/checkout.sh github.com/mitsuhiko/minijinja --path-only
+bash /absolute/path/to/skills/librarian/checkout.sh https://github.com/mitsuhiko/minijinja --path-only
 ```
 
 The script will:
-1. Parse the repo reference into host/org/repo.
+1. Parse and validate the repo reference into a safe host/org/repo cache path.
 2. Clone if missing.
-3. Reuse existing checkout if present.
+3. Reuse an existing checkout if present, retaining its configured `origin`.
 4. Fetch from `origin` when stale (default interval: 300s).
 5. Attempt a fast-forward merge if the checkout is clean and has an upstream.
 
@@ -47,7 +49,7 @@ The script will:
 - Force immediate refresh with:
 
 ```bash
-bash checkout.sh <repo> --force-update --path-only
+bash /absolute/path/to/skills/librarian/checkout.sh <repo> --force-update --path-only
 ```
 
 ## Recommended workflow
@@ -63,3 +65,5 @@ Prefer not to edit directly in the shared cache. Create a separate worktree or c
 ## Notes
 
 - `owner/repo` defaults to `github.com`.
+- Shorthand and web URLs clone over HTTPS. Explicit `git@host:org/repo.git` and `ssh://` references clone over SSH; ensure the relevant credentials are available.
+- Repository components containing traversal segments (`.` or `..`) or unsafe characters are rejected.

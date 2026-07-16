@@ -166,26 +166,47 @@ parse_repo() {
   printf '%s\n%s\n%s\n' "$host" "$org" "$repo"
 }
 
-parsed_host=""
-parsed_org=""
-parsed_repo=""
-parsed_index=0
+# Do not use process substitution here: its failure status is not propagated to
+# this shell, which could otherwise leave these values empty after a parse error.
+if ! parsed="$(parse_repo "$repo_input")"; then
+  exit 2
+fi
+parsed_parts=()
 while IFS= read -r line; do
-  case "$parsed_index" in
-    0) parsed_host="$line" ;;
-    1) parsed_org="$line" ;;
-    2) parsed_repo="$line" ;;
-  esac
-  parsed_index=$((parsed_index + 1))
-done < <(parse_repo "$repo_input")
+  parsed_parts[${#parsed_parts[@]}]="$line"
+done <<< "$parsed"
+if [[ ${#parsed_parts[@]} -ne 3 ]]; then
+  echo "error: failed to parse repository: $repo_input" >&2
+  exit 2
+fi
 
-host="$parsed_host"
-org="$parsed_org"
-repo="$parsed_repo"
+host="${parsed_parts[0]}"
+org="${parsed_parts[1]}"
+repo="${parsed_parts[2]}"
+
+# Keep cache paths strictly below the configured cache root. Git hosts, groups,
+# and repository names never need path traversal or whitespace characters.
+if ! [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || [[ "$host" == "." || "$host" == ".." ]]; then
+  echo "error: invalid repository host: $host" >&2
+  exit 2
+fi
+IFS='/' read -r -a path_parts <<< "$org/$repo"
+for part in "${path_parts[@]}"; do
+  if [[ -z "$part" || "$part" == "." || "$part" == ".." || ! "$part" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "error: invalid repository path component: $part" >&2
+    exit 2
+  fi
+done
 
 cache_root="${LIBRARIAN_CACHE_ROOT:-$HOME/.cache/checkouts}"
 checkout_path="$cache_root/$host/$org/$repo"
-origin_url="https://$host/$org/$repo.git"
+# Preserve SSH when it was explicitly requested; shorthand and web URLs use
+# HTTPS. An existing cache keeps its configured origin to avoid surprising
+# transport changes when it is referenced later with a different spelling.
+case "$(trim_repo_input "$repo_input")" in
+  git@*:*|ssh://*) origin_url="git@$host:$org/$repo.git" ;;
+  *) origin_url="https://$host/$org/$repo.git" ;;
+esac
 
 mkdir -p "$(dirname "$checkout_path")"
 
@@ -203,12 +224,6 @@ fi
 
 if ! git -C "$checkout_path" remote get-url origin >/dev/null 2>&1; then
   git -C "$checkout_path" remote add origin "$origin_url"
-fi
-
-# If remote URL changed (e.g. host shorthand), normalize to canonical HTTPS URL.
-current_origin="$(git -C "$checkout_path" remote get-url origin 2>/dev/null || true)"
-if [[ "$current_origin" != "$origin_url" ]]; then
-  git -C "$checkout_path" remote set-url origin "$origin_url"
 fi
 
 last_fetch_file="$checkout_path/.git/librarian-last-fetch"

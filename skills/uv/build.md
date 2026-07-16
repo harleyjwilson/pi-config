@@ -1,6 +1,6 @@
 # uv Build Backend
 
-Use `uv_build` for pure Python packages. For extension modules, use `hatchling` instead.
+Use `uv_build` for pure Python packages. For extension modules, select a backend for the relevant technology (for example, `maturin` or `scikit-build-core`); use `hatchling` when its flexible build configuration fits the project.
 
 ## pyproject.toml
 
@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 dependencies = []
 
 [build-system]
-requires = ["uv_build>=0.9.28,<0.10.0"]
+requires = ["uv_build>=0.11.29,<0.12"]
 build-backend = "uv_build"
 ```
 
