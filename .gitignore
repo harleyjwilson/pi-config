@@ -3,6 +3,8 @@
 sessions/
 bin/
 auth.json
+models-store.json
+trust.json
 
 # Pi runtime files
 git/
@@ -11,8 +13,8 @@ mcp-npx-cache.json
 run-history.jsonl
 session-manager-config.toml
 
-# Extension dependencies
-extensions/*/node_modules/
+# Dependency installs
+node_modules/
 
 # OS files
 .DS_Store
