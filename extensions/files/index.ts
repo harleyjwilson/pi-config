@@ -306,14 +306,6 @@ const collectRecentFileReferences = (
   return results;
 };
 
-const findLatestFileReference = (
-  entries: SessionEntry[],
-  cwd: string,
-): FileReference | null => {
-  const refs = collectRecentFileReferences(entries, cwd, 100);
-  return refs.find((ref) => ref.exists) ?? null;
-};
-
 const toCanonicalPath = (
   inputPath: string,
 ): { canonicalPath: string; isDirectory: boolean } | null => {
@@ -1374,43 +1366,4 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerShortcut("ctrl+shift+o", {
-    description: "Browse files mentioned in the session",
-    handler: async (ctx) => {
-      await runFileBrowser(pi, ctx);
-    },
-  });
-
-  pi.registerShortcut("ctrl+shift+f", {
-    description: "Reveal the latest file reference in Finder",
-    handler: async (ctx) => {
-      const entries = ctx.sessionManager.getBranch();
-      const latest = findLatestFileReference(entries, ctx.cwd);
-
-      if (!latest) {
-        ctx.ui.notify("No file reference found in the session", "warning");
-        return;
-      }
-
-      const canonical = toCanonicalPath(latest.path);
-      if (!canonical) {
-        ctx.ui.notify(`File not found: ${latest.display}`, "error");
-        return;
-      }
-
-      await revealPath(pi, ctx, {
-        canonicalPath: canonical.canonicalPath,
-        resolvedPath: canonical.canonicalPath,
-        displayPath: latest.display,
-        exists: true,
-        isDirectory: canonical.isDirectory,
-        status: undefined,
-        inRepo: false,
-        isTracked: false,
-        isReferenced: true,
-        hasSessionChange: false,
-        lastTimestamp: 0,
-      });
-    },
-  });
 }
