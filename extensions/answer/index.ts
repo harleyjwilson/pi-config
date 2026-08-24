@@ -1,10 +1,10 @@
 /**
- * Q&A extraction hook - extracts questions from assistant responses
+ * Q&A extraction hook - extracts questions and structured decision prompts from the active conversation
  *
  * Custom interactive TUI for answering questions.
  *
  * Demonstrates the "prompt generator" pattern with custom TUI:
- * 1. /answer command gets the last assistant message
+ * 1. /answer command finds the most recent locally recognizable question or decision prompt
  * 2. Shows a spinner while extracting questions as structured JSON
  * 3. Presents an interactive TUI to navigate and answer questions
  * 4. Submits the compiled answers when done
@@ -53,12 +53,14 @@ Output a JSON object with this structure:
 }
 
 Rules:
-- Extract all questions that require user input
+- Return only the JSON object—no prose, Markdown, or code fences
+- Extract all questions and explicit requests that require user input
 - Keep questions in the order they appeared
 - Be concise with question text
 - Include context only when it provides essential information for answering
 - In numbered lists, include wrapped continuation lines as part of the same question
 - If a numbered item is only a section heading and its bullets are questions, extract each bullet as a question and use the heading as context
+- When a message defines lettered choices (for example, A/B/C) and asks for one choice per numbered item, extract every numbered item as a question; include the choice definitions and section heading as context
 - Treat text like "Templates: should templates be project-level only..." as a question even if it has no trailing question mark
 - If no questions are found, return {"questions": []}
 
@@ -107,32 +109,81 @@ async function selectExtractionModel(
 }
 
 /**
- * Parse the JSON response from the LLM
+ * Find the end of a JSON object without being confused by braces inside strings.
+ */
+function findJsonObjectEnd(text: string, start: number): number | null {
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+
+	for (let index = start; index < text.length; index++) {
+		const character = text[index];
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+			} else if (character === "\\") {
+				escaped = true;
+			} else if (character === '"') {
+				inString = false;
+			}
+			continue;
+		}
+
+		if (character === '"') {
+			inString = true;
+		} else if (character === "{") {
+			depth++;
+		} else if (character === "}" && --depth === 0) {
+			return index + 1;
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Parse the JSON response from the LLM. The extractor should return JSON only,
+ * but accepting a JSON object embedded in prose prevents a recoverable format
+ * deviation from aborting the whole Q&A flow.
  */
 function parseExtractionResult(text: string): ExtractionResult | null {
-	try {
-		// Try to find JSON in the response (it might be wrapped in markdown code blocks)
-		let jsonStr = text;
+	const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+	const candidates = [codeBlock, text].filter((candidate): candidate is string => Boolean(candidate));
 
-		// Remove markdown code block if present
-		const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-		if (jsonMatch) {
-			jsonStr = jsonMatch[1].trim();
-		}
+	for (const candidate of candidates) {
+		for (let start = candidate.indexOf("{"); start !== -1; start = candidate.indexOf("{", start + 1)) {
+			const end = findJsonObjectEnd(candidate, start);
+			if (end === null) continue;
 
-		const parsed = JSON.parse(jsonStr);
-		if (parsed && Array.isArray(parsed.questions)) {
-			return parsed as ExtractionResult;
+			try {
+				const parsed: unknown = JSON.parse(candidate.slice(start, end));
+				if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as ExtractionResult).questions)) {
+					continue;
+				}
+
+				const questions = (parsed as ExtractionResult).questions
+					.filter((question): question is ExtractedQuestion =>
+						Boolean(question) && typeof question.question === "string" && question.question.trim().length > 0,
+					)
+					.map(({ question, context }) => ({
+						question: normalizeQuestionText(question),
+						...(typeof context === "string" && context.trim() ? { context: normalizeQuestionText(context) } : {}),
+					}));
+				return { questions };
+			} catch {
+				// Try the next JSON-looking object in the response.
+			}
 		}
-		return null;
-	} catch {
-		return null;
 	}
+
+	return null;
 }
 
 const QUESTION_START_RE = /^(?:can|could|do|does|did|should|would|will|what|when|where|which|who|why|how|is|are|am|was|were)\b/i;
-const NUMBERED_ITEM_RE = /^\s*\d+[.)]\s+(.*)$/;
+const REQUEST_START_RE = /^(?:(?:please|kindly)\s+)?(?:provide|share|give|list|supply|confirm|identify|name|describe|summarize|explain|calculate|show)\b/i;
+const NUMBERED_ITEM_RE = /^\s*(\d+)[.)]\s+(.*)$/;
 const BULLET_ITEM_RE = /^\s*[-*+]\s+(.*)$/;
+const CHOICE_LEGEND_ITEM_RE = /^\s*[-*+]\s*([A-Z])\s*=\s*(.+)$/i;
 
 function normalizeQuestionText(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
@@ -145,6 +196,64 @@ function looksLikeQuestion(text: string): boolean {
 
 	const withoutLeadingLabel = normalized.replace(/^[^:]{1,80}:\s*/, "");
 	return QUESTION_START_RE.test(withoutLeadingLabel);
+}
+
+function looksLikeRequestHeading(text: string): boolean {
+	return REQUEST_START_RE.test(normalizeQuestionText(text).replace(/:$/, ""));
+}
+
+/**
+ * Extract numbered items from a multiple-choice decision list without asking an LLM.
+ *
+ * This supports package-reconciliation prompts that define choices such as
+ * "A = add it to the other OS" and then ask for one A/B/C response per item.
+ */
+function extractNumberedChoiceList(text: string): ExtractionResult | null {
+	const lines = text.replace(/\r\n/g, "\n").split("\n");
+	const choiceLegend = new Map<string, string>();
+
+	for (const line of lines) {
+		const choiceMatch = line.match(CHOICE_LEGEND_ITEM_RE);
+		if (choiceMatch) {
+			choiceLegend.set(choiceMatch[1].toUpperCase(), normalizeQuestionText(choiceMatch[2]));
+		}
+	}
+
+	if (!["A", "B", "C"].every((choice) => choiceLegend.has(choice))) {
+		return null;
+	}
+
+	const choiceContext = ["A", "B", "C"]
+		.map((choice) => `${choice} = ${choiceLegend.get(choice)}`)
+		.join("\n");
+	const questions: ExtractedQuestion[] = [];
+	let currentSectionHeading: string | undefined;
+
+	for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+		const rawLine = lines[lineIndex];
+		const numberedMatch = rawLine.match(NUMBERED_ITEM_RE);
+		if (numberedMatch) {
+			const item = normalizeQuestionText(numberedMatch[2]);
+			if (item) {
+				const question = `${numberedMatch[1]}. ${item}`;
+				const context = [currentSectionHeading, choiceContext].filter(Boolean).join("\n");
+				questions.push({ question, context });
+			}
+			continue;
+		}
+
+		if (rawLine.match(BULLET_ITEM_RE) || !rawLine.trim()) {
+			continue;
+		}
+
+		const previousLineIsBlank = lineIndex === 0 || !lines[lineIndex - 1].trim();
+		const nextLineIsBlank = lineIndex === lines.length - 1 || !lines[lineIndex + 1].trim();
+		if (previousLineIsBlank || nextLineIsBlank) {
+			currentSectionHeading = normalizeQuestionText(rawLine).replace(/:$/, "") || undefined;
+		}
+	}
+
+	return questions.length > 0 ? { questions } : null;
 }
 
 /**
@@ -161,8 +270,17 @@ function looksLikeQuestion(text: string): boolean {
 function extractStructuredQuestionList(text: string): ExtractionResult | null {
 	const questions: ExtractedQuestion[] = [];
 	const lines = text.replace(/\r\n/g, "\n").split("\n");
-	let currentNumbered: { text: string; bullets: string[] } | null = null;
+	let currentNumbered: { text: string; bullets: string[]; requestContext?: string } | null = null;
 	let currentBulletIndex: number | null = null;
+	let requestContext: string | undefined;
+
+	const addRequestedItem = (item: string, context?: string) => {
+		const question = normalizeQuestionText(item);
+		if (!question) return;
+		if (looksLikeQuestion(question) || context) {
+			questions.push({ question, ...(context ? { context } : {}) });
+		}
+	};
 
 	const flushCurrent = () => {
 		if (!currentNumbered) return;
@@ -171,16 +289,21 @@ function extractStructuredQuestionList(text: string): ExtractionResult | null {
 		if (currentNumbered.bullets.length > 0) {
 			for (const bullet of currentNumbered.bullets) {
 				const bulletText = normalizeQuestionText(bullet);
-				if (!looksLikeQuestion(bulletText)) continue;
+				if (!bulletText) continue;
 
-				if (looksLikeQuestion(heading)) {
-					questions.push({ question: bulletText, context: heading });
-				} else {
-					questions.push({ question: bulletText, context: heading.replace(/:$/, "") });
+				if (
+					currentNumbered.requestContext ||
+					looksLikeQuestion(heading) ||
+					looksLikeQuestion(bulletText)
+				) {
+					const context = looksLikeQuestion(heading)
+						? heading
+						: currentNumbered.requestContext ?? heading.replace(/:$/, "");
+					addRequestedItem(bulletText, context);
 				}
 			}
-		} else if (looksLikeQuestion(heading)) {
-			questions.push({ question: heading });
+		} else {
+			addRequestedItem(heading, currentNumbered.requestContext);
 		}
 
 		currentNumbered = null;
@@ -188,14 +311,20 @@ function extractStructuredQuestionList(text: string): ExtractionResult | null {
 	};
 
 	for (const rawLine of lines) {
+		const normalizedLine = normalizeQuestionText(rawLine);
 		const numberedMatch = rawLine.match(NUMBERED_ITEM_RE);
 		if (numberedMatch) {
 			flushCurrent();
-			currentNumbered = { text: numberedMatch[1], bullets: [] };
+			currentNumbered = { text: numberedMatch[2], bullets: [], requestContext };
 			continue;
 		}
 
-		if (!currentNumbered) continue;
+		if (!currentNumbered) {
+			if (looksLikeRequestHeading(normalizedLine)) {
+				requestContext = normalizedLine.replace(/:$/, "");
+			}
+			continue;
+		}
 
 		const bulletMatch = rawLine.match(BULLET_ITEM_RE);
 		if (bulletMatch) {
@@ -213,6 +342,9 @@ function extractStructuredQuestionList(text: string): ExtractionResult | null {
 			currentNumbered.text += ` ${continuation}`;
 		} else {
 			flushCurrent();
+			if (looksLikeRequestHeading(normalizedLine)) {
+				requestContext = normalizedLine.replace(/:$/, "");
+			}
 		}
 	}
 
@@ -510,36 +642,44 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Find the last assistant message on the current branch
 			const branch = ctx.sessionManager.getBranch();
 			let lastAssistantText: string | undefined;
+			let extractionResult: ExtractionResult | null = null;
 
+			// Prefer a locally recognizable prompt anywhere on the active branch. This lets
+			// /answer recover a numbered choice list after intervening status messages and
+			// supports an explicitly submitted decision list from the user.
 			for (let i = branch.length - 1; i >= 0; i--) {
 				const entry = branch[i];
-				if (entry.type === "message") {
-					const msg = entry.message;
-					if ("role" in msg && msg.role === "assistant") {
-						if (msg.stopReason !== "stop") {
-							ctx.ui.notify(`Last assistant message incomplete (${msg.stopReason})`, "error");
-							return;
-						}
-						const textParts = msg.content
-							.filter((c): c is { type: "text"; text: string } => c.type === "text")
-							.map((c) => c.text);
-						if (textParts.length > 0) {
-							lastAssistantText = textParts.join("\n");
-							break;
-						}
-					}
+				if (entry.type !== "message") continue;
+
+				const message = entry.message;
+				if (!("role" in message) || (message.role !== "assistant" && message.role !== "user")) continue;
+				if (message.role === "assistant" && message.stopReason !== "stop") continue;
+
+				const text = message.content
+					.filter((content): content is { type: "text"; text: string } => content.type === "text")
+					.map((content) => content.text)
+					.join("\n");
+				if (!text) continue;
+
+				if (message.role === "assistant" && !lastAssistantText) {
+					lastAssistantText = text;
+				}
+
+				const locallyExtractedQuestions =
+					extractNumberedChoiceList(text) ?? extractStructuredQuestionList(text);
+				if (locallyExtractedQuestions) {
+					extractionResult = locallyExtractedQuestions;
+					break;
 				}
 			}
 
-			if (!lastAssistantText) {
-				ctx.ui.notify("No assistant messages found", "error");
+			if (!extractionResult && !lastAssistantText) {
+				ctx.ui.notify("No completed assistant messages found", "error");
 				return;
 			}
 
-			let extractionResult = extractStructuredQuestionList(lastAssistantText);
 			let extractionOutcome: ExtractionOutcome = { result: extractionResult };
 
 			if (!extractionResult) {
@@ -637,7 +777,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerCommand("answer", {
-		description: "Extract questions from last assistant message into interactive Q&A",
+		description: "Extract questions or numbered choices into interactive Q&A",
 		handler: (_args, ctx) => answerHandler(ctx),
 	});
 
