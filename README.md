@@ -8,7 +8,7 @@ Clone this repo to `~/.pi/agent/`, add your API keys to `~/.pi/agent/auth.json`,
 
 ```bash
 mkdir -p ~/.pi
-git clone ssh://git@codeberg.org/hjw/pi-config.git ~/.pi/agent
+git clone git@github.com:harleyjwilson/pi-config.git ~/.pi/agent
 ```
 
 To update later:
