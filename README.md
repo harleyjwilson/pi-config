@@ -24,19 +24,6 @@ cd ~/.pi/agent/extensions/brave-search && npm install
 cd ~/.pi/agent/extensions/youtube-transcript && npm install
 ```
 
-## Skills
-
-Loaded on demand when relevant.
-
-| Skill                         | Purpose                                                                |
-| ----------------------------- | ---------------------------------------------------------------------- |
-| **commit**                    | Instructions for making git commits                                    |
-| **librarian**                 | Cache and refresh remote git repositories for local reference          |
-| **svelte-code-writer**        | Svelte 5 documentation lookup and component/module analysis            |
-| **svelte-core-bestpractices** | Guidance for robust modern Svelte code                                 |
-| **uv**                        | Prefer `uv` over `pip`, `python -m venv`, and related Python workflows |
-| **write-discoverable-code**   | Make code easy to find and understand through plain-text search        |
-
 ## Extensions
 
 | Extension               | What it does                                                                 |
@@ -67,10 +54,8 @@ Loaded on demand when relevant.
 
 ## References and credits
 
-Extensions and skills in this config are adapted from or inspired by these projects:
+Extensions in this config are adapted from or inspired by these projects:
 
-- [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff) — source/inspiration for `answer`, `files`, `review`, `todos`, `uv`, and the `commit`, `librarian`, and `uv` skills.
+- [mitsuhiko/agent-stuff](https://github.com/mitsuhiko/agent-stuff) — source/inspiration for `answer`, `files`, `review`, `todos`, and `uv`.
 - [badlogic/pi-skills](https://github.com/badlogic/pi-skills) — source/inspiration for the `youtube-transcript` and `brave-search` extensions.
-- [sveltejs/ai-tools](https://github.com/sveltejs/ai-tools/tree/main/tools/skills) — source for the `svelte-code-writer` and `svelte-core-bestpractices` skills.
 - [davis7dotsh/my-pi-setup](https://github.com/davis7dotsh/my-pi-setup) — source/inspiration for the `update` extension.
-- [modem-dev/skills](https://github.com/modem-dev/skills/tree/main/write-discoverable-code) — source for the `write-discoverable-code` skill.
